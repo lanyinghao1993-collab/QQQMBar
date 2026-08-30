@@ -982,6 +982,16 @@ private struct ChartTradeEvent: Identifiable {
     let direction: TradeDirection
 }
 
+private func exponentialMovingAverage(_ points: [PricePoint], period: Int) -> [PricePoint] {
+    guard period > 0, let first = points.first else { return [] }
+    let alpha = 2.0 / Double(period + 1)
+    var value = first.close
+    return points.enumerated().map { index, point in
+        if index > 0 { value = point.close * alpha + value * (1 - alpha) }
+        return PricePoint(date: point.date, close: value)
+    }
+}
+
 private struct PositionCostVisualizer: View {
     let averageCost: Double
     let currentPrice: Double
@@ -1024,8 +1034,10 @@ struct PriceChartView: View {
     let snapshot: QQQMSnapshot
     @State private var selectedDate: Date?
 
+    private var ema20: [PricePoint] { exponentialMovingAverage(snapshot.priceHistory, period: 20) }
+
     private var chartDomain: ClosedRange<Double> {
-        let values = snapshot.priceHistory.map(\.close) + tradeEvents.map(\.price)
+        let values = snapshot.priceHistory.map(\.close) + ema20.map(\.close) + tradeEvents.map(\.price)
         guard let low = values.min(), let high = values.max() else { return 0...1 }
         let padding = max((high - low) * 0.10, high * 0.004)
         return (low - padding)...(high + padding)
@@ -1079,6 +1091,12 @@ struct PriceChartView: View {
                 LineMark(x: .value("日期", point.date), y: .value("价格", point.close), series: .value("系列", "价格"))
                     .foregroundStyle(DashboardPalette.blue)
                     .lineStyle(.init(lineWidth: 1.7, lineCap: .round, lineJoin: .round))
+                    .interpolationMethod(.catmullRom)
+            }
+            ForEach(ema20) { point in
+                LineMark(x: .value("日期", point.date), y: .value("EMA20", point.close), series: .value("系列", "EMA20"))
+                    .foregroundStyle(DashboardPalette.orange.opacity(0.92))
+                    .lineStyle(.init(lineWidth: 1.05, lineCap: .round, lineJoin: .round))
                     .interpolationMethod(.catmullRom)
             }
             if let last = snapshot.priceHistory.last {
@@ -1135,7 +1153,7 @@ struct PriceChartView: View {
             plot.background(Color.clear)
         }
         .chartXSelection(value: $selectedDate)
-        .accessibilityLabel("QQQM 最近 30 个交易日收盘价与成交点")
+        .accessibilityLabel("QQQM 最近 30 个交易日收盘价、EMA20 趋势与成交点")
     }
 }
 
@@ -1241,6 +1259,8 @@ struct MenuPopoverView: View {
                     }
                 }
                 HStack(spacing: 10) {
+                    seriesLegend("价格", DashboardPalette.cyan)
+                    seriesLegend("EMA20", DashboardPalette.orange)
                     tradeLegend("B", "买入 \(snapshot.buyMarkers.filter { $0.quantity > 0 }.count)", DashboardPalette.green)
                     tradeLegend("S", "卖出 \(snapshot.buyMarkers.filter { $0.quantity < 0 }.count)", DashboardPalette.coral)
                 }
@@ -1378,6 +1398,12 @@ struct MenuPopoverView: View {
         HStack(spacing: 3) {
             Text(code).font(.system(size: 5, weight: .bold, design: .rounded)).foregroundStyle(.white)
                 .frame(width: 10, height: 10).background(color, in: Circle())
+            Text(text).foregroundStyle(DashboardPalette.muted)
+        }
+    }
+    private func seriesLegend(_ text: String, _ color: Color) -> some View {
+        HStack(spacing: 3) {
+            Capsule().fill(color).frame(width: 9, height: 1.5)
             Text(text).foregroundStyle(DashboardPalette.muted)
         }
     }
@@ -1582,6 +1608,8 @@ struct QQQMBarSelfTest {
         precondition(snapshot.quote.dayLow == 294.45 && snapshot.quote.dayHigh == 298.16)
         precondition(abs(snapshot.quote.dayChangePct - ((295.00 / 296.92 - 1) * 100)) < 0.0001)
         precondition(snapshot.signals.count == 4 && snapshot.signals.allSatisfy { $0.value != "未接入" })
+        let ema = exponentialMovingAverage(snapshot.priceHistory, period: 20)
+        precondition(ema.count == snapshot.priceHistory.count && ema.allSatisfy { $0.close.isFinite && $0.close > 0 })
         precondition(snapshot.recommendation.nextExecution.formatted(.iso8601) == "2026-09-01T13:30:00Z")
         let now = Date()
         let calendar = Calendar.current

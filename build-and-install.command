@@ -19,8 +19,8 @@ cp "$PROJECT_DIR/QQQMBar/Info.plist" "$CONTENTS/Info.plist"
 plutil -replace CFBundleExecutable -string QQQMBar "$CONTENTS/Info.plist"
 plutil -replace CFBundleIdentifier -string com.lyh.qqqmbar "$CONTENTS/Info.plist"
 plutil -replace CFBundleName -string QQQMBar "$CONTENTS/Info.plist"
-plutil -replace CFBundleShortVersionString -string 0.12.0 "$CONTENTS/Info.plist"
-plutil -replace CFBundleVersion -string 20 "$CONTENTS/Info.plist"
+plutil -replace CFBundleShortVersionString -string 0.12.1 "$CONTENTS/Info.plist"
+plutil -replace CFBundleVersion -string 21 "$CONTENTS/Info.plist"
 
 xcrun swiftc -parse-as-library -O \
   "$PROJECT_DIR/QQQMBar/QQQMBarApp.swift" \
@@ -32,11 +32,16 @@ codesign --force --sign - --options runtime \
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 mkdir -p "$HOME/Applications"
+INSTALL_BACKUP="$HOME/Applications/.QQQMBar-install-backup.app"
+rm -rf "$INSTALL_BACKUP"
 if [[ -e "$DESTINATION" ]]; then
-  BACKUP="$HOME/Applications/QQQMBar-previous-$(date +%Y%m%d-%H%M%S).app"
-  mv "$DESTINATION" "$BACKUP"
-  echo "已保留旧版本：$BACKUP"
+  mv "$DESTINATION" "$INSTALL_BACKUP"
 fi
-mv "$APP" "$DESTINATION"
+if mv "$APP" "$DESTINATION"; then
+  rm -rf "$INSTALL_BACKUP"
+else
+  if [[ -e "$INSTALL_BACKUP" ]]; then mv "$INSTALL_BACKUP" "$DESTINATION"; fi
+  exit 1
+fi
 open "$DESTINATION"
 echo "已安装并启动：$DESTINATION"
