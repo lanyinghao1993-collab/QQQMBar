@@ -1129,7 +1129,7 @@ private enum QDesign {
     static let background = adaptive(light: 0xE9EFF0, dark: 0x01080B)
     static let surface = adaptive(light: 0xFBFCFC, dark: 0x071216)
     static let elevated = adaptive(light: 0xFFFFFF, dark: 0x0C191E)
-    static let separator = adaptive(light: 0xC9D4D6, dark: 0x263A40)
+    static let separator = adaptive(light: 0xD4DCDE, dark: 0x1C2D32)
     static let track = adaptive(light: 0xDFE7E8, dark: 0x1A2A2F)
     static let primary = Color(nsColor: .labelColor)
     static let secondary = Color(nsColor: .secondaryLabelColor)
@@ -1180,7 +1180,7 @@ private struct QDecisionCanvas<Content: View>: View {
             }
             .overlay {
                 RoundedRectangle(cornerRadius: QDesign.outerRadius, style: .continuous)
-                    .stroke(QDesign.separator.opacity(colorScheme == .dark ? 0.78 : 0.70), lineWidth: 0.65)
+                    .stroke(QDesign.separator.opacity(colorScheme == .dark ? 0.50 : 0.58), lineWidth: 0.4)
             }
     }
 }
@@ -1520,7 +1520,7 @@ private struct TierTransitionView: View {
         }
         .overlay {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .stroke(QDesign.separator.opacity(0.42), lineWidth: 0.5)
+                .stroke(QDesign.separator.opacity(0.28), lineWidth: 0.35)
         }
     }
 
@@ -1641,7 +1641,8 @@ struct MenuPopoverView: View {
             if let snapshot = model.snapshot { content(snapshot) }
             else { unavailable }
         }
-        .padding(10)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 8)
         .frame(width: DashboardLayout.width, height: resolvedHeight, alignment: .top)
         .background {
             ZStack {
@@ -1689,8 +1690,8 @@ struct MenuPopoverView: View {
 
     private var sectionDivider: some View {
         Rectangle()
-            .fill(QDesign.separator.opacity(0.82))
-            .frame(height: 0.65)
+            .fill(QDesign.separator.opacity(0.60))
+            .frame(height: 0.45)
             .padding(.horizontal, QDesign.sectionPadding)
     }
 
@@ -1792,7 +1793,7 @@ struct MenuPopoverView: View {
     private func evidencePanel(_ snapshot: QQQMSnapshot) -> some View {
         VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text("本期为什么是 \(usd(snapshot.recommendation.recommendedAmount))")
+                    Text("本期依据")
                         .font(.system(size: 10, weight: .semibold))
                     Spacer()
                     HStack(spacing: 5) {
@@ -1846,27 +1847,44 @@ struct MenuPopoverView: View {
                     moreReached: moreTriggerCount(snapshot) > 0,
                     lessReached: lessTriggerCount(snapshot) == 3
                 )
-                DisclosureGroup(isExpanded: $showFullRules) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.16)) {
+                        showFullRules.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "list.bullet.rectangle")
+                            .foregroundStyle(QDesign.secondary)
+                        Text("五档规则")
+                        Spacer()
+                        Text(showFullRules ? "收起" : "展开")
+                            .foregroundStyle(QDesign.secondary)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(QDesign.secondary)
+                            .rotationEffect(.degrees(showFullRules ? 180 : 0))
+                    }
+                    .font(.system(size: 8.5, weight: .medium))
+                    .frame(maxWidth: .infinity, minHeight: 24)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(showFullRules ? "收起五档规则" : "展开五档规则")
+
+                if showFullRules {
                     VStack(spacing: 6) {
                         Divider()
                         ThresholdRuleRow(amount: "$600", title: "明显多投", logic: "OR", conditions: strongMoreConditions, tint: QDesign.positive)
                         ThresholdRuleRow(amount: "$500", title: "适度多投", logic: "OR", conditions: moreConditions, tint: QDesign.positive)
+                        ThresholdRuleRow(amount: "$400", title: "维持基准", logic: "默认", conditions: "多投未触发；少投未全部满足", tint: QDesign.accent)
                         ThresholdRuleRow(amount: "$300", title: "适度少投", logic: "AND", conditions: lessConditions, tint: QDesign.caution)
                         ThresholdRuleRow(amount: "$200", title: "明显少投", logic: "AND", conditions: strongLessConditions, tint: QDesign.caution)
                         Text("分档规则用于保持纪律，不是收益预测，也不会自动下单。")
                             .font(.system(size: 7.5)).foregroundStyle(QDesign.tertiary)
                     }
                     .padding(.top, 3)
-                } label: {
-                    HStack {
-                        Text("完整五档规则")
-                        Spacer()
-                        Text(showFullRules ? "收起" : "查看门槛")
-                            .foregroundStyle(QDesign.secondary)
-                    }
-                    .font(.system(size: 8.5, weight: .medium))
+                    .transition(.opacity.combined(with: .move(edge: .top)))
                 }
-                .tint(QDesign.secondary)
         }
         .padding(12)
     }
