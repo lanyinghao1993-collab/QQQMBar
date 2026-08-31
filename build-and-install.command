@@ -19,8 +19,8 @@ cp "$PROJECT_DIR/QQQMBar/Info.plist" "$CONTENTS/Info.plist"
 plutil -replace CFBundleExecutable -string QQQMBar "$CONTENTS/Info.plist"
 plutil -replace CFBundleIdentifier -string com.lyh.qqqmbar "$CONTENTS/Info.plist"
 plutil -replace CFBundleName -string QQQMBar "$CONTENTS/Info.plist"
-plutil -replace CFBundleShortVersionString -string 0.13.8 "$CONTENTS/Info.plist"
-plutil -replace CFBundleVersion -string 31 "$CONTENTS/Info.plist"
+plutil -replace CFBundleShortVersionString -string 0.18.0 "$CONTENTS/Info.plist"
+plutil -replace CFBundleVersion -string 37 "$CONTENTS/Info.plist"
 
 xcrun swiftc -parse-as-library -O \
   "$PROJECT_DIR/QQQMBar/QQQMBarApp.swift" \
@@ -34,6 +34,15 @@ codesign --verify --deep --strict --verbose=2 "$APP"
 mkdir -p "$HOME/Applications"
 INSTALL_BACKUP="$HOME/Applications/.QQQMBar-install-backup.app"
 rm -rf "$INSTALL_BACKUP"
+
+# LaunchServices won't relaunch a menu-bar-only app whose previous process is
+# still holding the old bundle. Stop only QQQMBar, then replace it atomically.
+pkill -x QQQMBar 2>/dev/null || true
+for _ in {1..20}; do
+  pgrep -x QQQMBar >/dev/null || break
+  sleep 0.1
+done
+
 if [[ -e "$DESTINATION" ]]; then
   mv "$DESTINATION" "$INSTALL_BACKUP"
 fi

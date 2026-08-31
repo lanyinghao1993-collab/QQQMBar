@@ -141,11 +141,60 @@ private enum DCAAllocationBand: String, CaseIterable {
     }
 }
 
+private enum DCAThresholds {
+    static let strongMoreMomentum = -10.0
+    static let moreMomentum = -5.0
+    static let lessMomentum = 8.0
+    static let strongLessMomentum = 15.0
+    static let strongMoreSentiment = 25.0
+    static let moreSentiment = 40.0
+    static let lessSentiment = 65.0
+    static let strongLessSentiment = 75.0
+    static let strongMoreVIX = 32.0
+    static let moreVIX = 25.0
+    static let lessVIX = 22.0
+    static let strongLessVIX = 18.0
+}
+
+private struct DCAConditionAudit: Equatable {
+    let momentum: Double
+    let vix: Double?
+    let sentiment: Double
+
+    var moreChecks: [Bool] {
+        [momentum <= DCAThresholds.moreMomentum, sentiment < DCAThresholds.moreSentiment, vix.map { $0 >= DCAThresholds.moreVIX } ?? false]
+    }
+    var lessChecks: [Bool] {
+        [momentum >= DCAThresholds.lessMomentum, sentiment >= DCAThresholds.lessSentiment, vix.map { $0 < DCAThresholds.lessVIX } ?? false]
+    }
+    var moreCount: Int { moreChecks.filter { $0 }.count }
+    var lessCount: Int { lessChecks.filter { $0 }.count }
+    var band: DCAAllocationBand { dcaAllocationBand(momentum: momentum, vix: vix, sentimentScore: sentiment) }
+
+    // Positive values are the remaining distance to the standard tier.
+    // The ordering is always trend, sentiment, VIX so the UI and tests share
+    // the exact same decision semantics as dcaAllocationBand.
+    var moreGaps: [Double] {
+        [
+            max(0, momentum - DCAThresholds.moreMomentum),
+            max(0, sentiment - DCAThresholds.moreSentiment),
+            max(0, DCAThresholds.moreVIX - (vix ?? DCAThresholds.lessVIX))
+        ]
+    }
+    var lessGaps: [Double] {
+        [
+            max(0, DCAThresholds.lessMomentum - momentum),
+            max(0, DCAThresholds.lessSentiment - sentiment),
+            max(0, (vix ?? DCAThresholds.lessVIX) - DCAThresholds.lessVIX)
+        ]
+    }
+}
+
 private func dcaAllocationBand(momentum: Double, vix: Double?, sentimentScore: Double) -> DCAAllocationBand {
-    if momentum <= -10 || sentimentScore <= 25 || (vix.map { $0 >= 32 } ?? false) { return .strongIncrease }
-    if momentum <= -5 || sentimentScore < 40 || (vix.map { $0 >= 25 } ?? false) { return .increase }
-    if momentum >= 15 && sentimentScore >= 75 && (vix.map { $0 < 18 } ?? false) { return .strongDecrease }
-    if momentum >= 8 && sentimentScore >= 65 && (vix.map { $0 < 22 } ?? false) { return .decrease }
+    if momentum <= DCAThresholds.strongMoreMomentum || sentimentScore <= DCAThresholds.strongMoreSentiment || (vix.map { $0 >= DCAThresholds.strongMoreVIX } ?? false) { return .strongIncrease }
+    if momentum <= DCAThresholds.moreMomentum || sentimentScore < DCAThresholds.moreSentiment || (vix.map { $0 >= DCAThresholds.moreVIX } ?? false) { return .increase }
+    if momentum >= DCAThresholds.strongLessMomentum && sentimentScore >= DCAThresholds.strongLessSentiment && (vix.map { $0 < DCAThresholds.strongLessVIX } ?? false) { return .strongDecrease }
+    if momentum >= DCAThresholds.lessMomentum && sentimentScore >= DCAThresholds.lessSentiment && (vix.map { $0 < DCAThresholds.lessVIX } ?? false) { return .decrease }
     return .normal
 }
 
@@ -670,13 +719,21 @@ final class AppModel: ObservableObject {
     private let marketDataRevisionKey = "QQQMBar.marketDataRevision"
     private let marketDataRevision = "cnn-fear-greed-v1"
 
-    init(previewSnapshot: QQQMSnapshot? = nil) {
-        if let previewSnapshot {
+    init(
+        previewSnapshot: QQQMSnapshot? = nil,
+        previewConfirmation: PlanConfirmation? = nil,
+        previewMarketError: String? = nil,
+        previewLoadError: String? = nil,
+        previewIsRefreshing: Bool = false,
+        forcePreviewMode: Bool = false
+    ) {
+        if previewSnapshot != nil || forcePreviewMode {
             previewMode = true
             snapshot = previewSnapshot
-            confirmation = nil
-            loadError = nil
-            marketError = nil
+            confirmation = previewConfirmation
+            loadError = previewLoadError
+            marketError = previewMarketError
+            isRefreshing = previewIsRefreshing
             return
         }
         previewMode = false
@@ -805,6 +862,28 @@ private final class StatusBadgeView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
+private enum StatusPalette {
+    private static func color(_ hex: Int) -> NSColor {
+        NSColor(
+            calibratedRed: CGFloat((hex >> 16) & 0xFF) / 255,
+            green: CGFloat((hex >> 8) & 0xFF) / 255,
+            blue: CGFloat(hex & 0xFF) / 255,
+            alpha: 1
+        )
+    }
+
+    private static func adaptive(light: Int, dark: Int) -> NSColor {
+        NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? color(dark) : color(light)
+        }
+    }
+
+    static let accent = adaptive(light: 0x087C84, dark: 0x35C4C7)
+    static let positive = adaptive(light: 0x2A8D57, dark: 0x6BC887)
+    static let caution = adaptive(light: 0xA36A16, dark: 0xE1A43A)
+    static let negative = adaptive(light: 0xB94E48, dark: 0xE9776D)
+}
+
 @MainActor
 final class StatusBarController: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let model = AppModel()
@@ -840,7 +919,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSPopoverDeleg
         popover.behavior = .transient
         popover.animates = false
         popover.delegate = self
-        popover.contentSize = NSSize(width: 344, height: 600)
+        popover.contentSize = NSSize(width: DashboardLayout.width, height: DashboardLayout.height)
         popover.contentViewController = NSHostingController(rootView: MenuPopoverView().environmentObject(model))
         updateStatusItem()
         observation = model.objectWillChange.sink { [weak self] _ in
@@ -976,16 +1055,17 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSPopoverDeleg
         button.imagePosition = .imageOnly
         statusItem?.length = NSStatusItem.squareLength
         let recommendationColor: NSColor = switch model.snapshot?.recommendation.kind {
-        case .increase: .systemGreen
-        case .decrease: .systemOrange
-        default: .systemTeal
+        case .increase: StatusPalette.positive
+        case .decrease: StatusPalette.caution
+        default: StatusPalette.accent
         }
-        let badgeColor: NSColor? = switch reminder {
-        case "✓": .systemGreen
+        let reminderBadgeColor: NSColor? = switch reminder {
+        case "✓": StatusPalette.positive
         case "今日", "明日", "2天", "3天": recommendationColor
-        case "逾期", "!": .systemRed
+        case "逾期", "!": StatusPalette.negative
         default: nil
         }
+        let badgeColor: NSColor? = model.marketError == nil ? reminderBadgeColor : StatusPalette.caution
         statusBadge.layer?.backgroundColor = badgeColor?.cgColor
         statusBadge.isHidden = badgeColor == nil
         var labelParts = [statusLabel(for: model.iconState)]
@@ -993,6 +1073,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSPopoverDeleg
             labelParts.append("\(recommendation.kind.label) US$\(Int(recommendation.recommendedAmount))")
         }
         if !reminder.isEmpty { labelParts.append(reminder) }
+        if model.marketError != nil { labelParts.append("市场数据更新失败，正在使用上一份有效快照") }
         let label = labelParts.joined(separator: "，")
         button.setAccessibilityLabel(label)
         button.toolTip = label
@@ -1010,7 +1091,24 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSPopoverDeleg
     }
 }
 
-private enum DashboardPalette {
+private enum DashboardLayout {
+    static let width: CGFloat = 372
+    static let height: CGFloat = 790
+}
+
+private enum TradeDirection: String { case buy, sell }
+
+private func exponentialMovingAverage(_ points: [PricePoint], period: Int) -> [PricePoint] {
+    guard period > 0, let first = points.first else { return [] }
+    let smoothing = 2.0 / (Double(period) + 1.0)
+    var value = first.close
+    return points.enumerated().map { index, point in
+        if index > 0 { value = point.close * smoothing + value * (1 - smoothing) }
+        return PricePoint(date: point.date, close: value)
+    }
+}
+
+private enum QDesign {
     private static func nsColor(_ hex: Int) -> NSColor {
         NSColor(
             calibratedRed: CGFloat((hex >> 16) & 0xFF) / 255,
@@ -1026,166 +1124,138 @@ private enum DashboardPalette {
         })
     }
 
-    // Famous Holdings-inspired system: neutral surfaces first, color only for
-    // emphasis and meaning. Every token has an independently tuned light and
-    // dark value instead of applying one palette through opacity.
-    static let background = adaptive(light: 0xF1F5F6, dark: 0x02090C)
-    static let card = adaptive(light: 0xFAFCFC, dark: 0x071319)
-    static let elevated = adaptive(light: 0xFFFFFF, dark: 0x0D1A20)
-    static let border = adaptive(light: 0xC8D5D7, dark: 0x263A40)
-    static let track = adaptive(light: 0xDFE8E9, dark: 0x1A2A2F)
-    static let text = adaptive(light: 0x102126, dark: 0xEDF3F4)
-    static let muted = adaptive(light: 0x61757A, dark: 0x9AAEB2)
-    static let accent = adaptive(light: 0x007F82, dark: 0x00C7C6)
-    static let cyan = accent
-    static let blue = adaptive(light: 0x087A83, dark: 0x28BFC7)
-    static let green = adaptive(light: 0x2C9354, dark: 0x70C883)
-    static let orange = adaptive(light: 0xA86E08, dark: 0xE5A62B)
-    static let coral = adaptive(light: 0xC34E45, dark: 0xED7061)
-    static let steel = adaptive(light: 0x71898F, dark: 0x789096)
-    static let rest = adaptive(light: 0x82979C, dark: 0x557078)
-    // Residual assets share the same neutral rail as the adjacent position
-    // cost visualizer; only actionable QQQM and cash segments carry color.
-    static let otherAssets = track
-    static let gold = orange
+    // One quiet material family for the whole product. The light and dark
+    // values are tuned independently; color is reserved for meaning.
+    static let background = adaptive(light: 0xE9EFF0, dark: 0x01080B)
+    static let surface = adaptive(light: 0xFBFCFC, dark: 0x071216)
+    static let elevated = adaptive(light: 0xFFFFFF, dark: 0x0C191E)
+    static let separator = adaptive(light: 0xC9D4D6, dark: 0x263A40)
+    static let track = adaptive(light: 0xDFE7E8, dark: 0x1A2A2F)
+    static let primary = Color(nsColor: .labelColor)
+    static let secondary = Color(nsColor: .secondaryLabelColor)
+    static let tertiary = Color(nsColor: .tertiaryLabelColor)
+    static let accent = adaptive(light: 0x087C84, dark: 0x35C4C7)
+    static let positive = adaptive(light: 0x2A8D57, dark: 0x6BC887)
+    static let caution = adaptive(light: 0xA36A16, dark: 0xE1A43A)
+    static let negative = adaptive(light: 0xB94E48, dark: 0xE9776D)
     static let buttonText = adaptive(light: 0xFFFFFF, dark: 0x031012)
-    static let ink = adaptive(light: 0x102126, dark: 0x031012)
+
+    static let outerRadius: CGFloat = 16
+    static let innerRadius: CGFloat = 9
+    static let sectionPadding: CGFloat = 12
 }
 
-private enum DashboardLayout {
-    static let width: CGFloat = 344
-    static let height: CGFloat = 600
-    static let contentWidth: CGFloat = 330
-    static let gutter: CGFloat = 4
-    static let halfCardWidth: CGFloat = 163
-    static let thirdCardWidth: CGFloat = 107.33
+private enum QFormat {
+    static func usd(_ amount: Double, decimals: Int = 0) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .currency
+        formatter.currencyCode = "USD"
+        formatter.currencySymbol = "$"
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.minimumFractionDigits = decimals
+        formatter.maximumFractionDigits = decimals
+        return formatter.string(from: NSNumber(value: amount)) ?? "$\(amount)"
+    }
+
+    static func signedUSD(_ amount: Double, decimals: Int = 2) -> String {
+        "\(amount >= 0 ? "+" : "−")\(usd(abs(amount), decimals: decimals))"
+    }
+
+    static func percent(_ value: Double, decimals: Int = 1, signed: Bool = true) -> String {
+        String(format: signed ? "%+.*f%%" : "%.*f%%", decimals, value)
+    }
 }
 
-private struct DashboardCard<Content: View>: View {
+private struct QDecisionCanvas<Content: View>: View {
     @Environment(\.colorScheme) private var colorScheme
-    let tint: Color
     @ViewBuilder let content: Content
-    init(tint: Color = DashboardPalette.steel, @ViewBuilder content: () -> Content) { self.tint = tint; self.content = content() }
+
+    init(@ViewBuilder content: () -> Content) { self.content = content() }
+
     var body: some View {
         content
-            .padding(8)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .background {
-                let shape = RoundedRectangle(cornerRadius: 11, style: .continuous)
-                ZStack {
-                    shape.fill(DashboardPalette.card)
-                    shape.fill(RadialGradient(colors: [tint.opacity(colorScheme == .light ? 0.045 : 0.10), .clear], center: .topLeading, startRadius: 0, endRadius: 155))
-                    shape.fill(LinearGradient(colors: [Color.white.opacity(colorScheme == .light ? 0.42 : 0.035), .clear], startPoint: .top, endPoint: .center))
-                }
+                RoundedRectangle(cornerRadius: QDesign.outerRadius, style: .continuous)
+                    .fill(QDesign.surface.opacity(colorScheme == .dark ? 0.93 : 0.98))
             }
-            .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(DashboardPalette.border.opacity(colorScheme == .light ? 0.78 : 0.88), lineWidth: 0.6))
-            .shadow(color: Color.black.opacity(colorScheme == .light ? 0.045 : 0.30), radius: colorScheme == .light ? 6 : 15, y: colorScheme == .light ? 2 : 8)
-            .clipped()
+            .overlay {
+                RoundedRectangle(cornerRadius: QDesign.outerRadius, style: .continuous)
+                    .stroke(QDesign.separator.opacity(colorScheme == .dark ? 0.78 : 0.70), lineWidth: 0.65)
+            }
     }
 }
 
-private struct RingBadge: View {
-    let confirmed: Bool
-    let isRefreshing: Bool
-    var pendingTint: Color = DashboardPalette.accent
+private struct QuoteContextStrip: View {
+    let periodReturn: Double
+    let periodTint: Color
+    let costDeviation: Double?
+    let valuation: String
 
     var body: some View {
-        ZStack {
-            Circle()
-                .fill(DashboardPalette.elevated)
-                .overlay(Circle().stroke(DashboardPalette.border, lineWidth: 0.7))
-            Text("Q")
-                .font(.system(size: 25, weight: .medium, design: .default))
-                .foregroundStyle(DashboardPalette.text)
-                .offset(y: -0.5)
-            Circle()
-                .fill(isRefreshing ? DashboardPalette.blue : (confirmed ? DashboardPalette.green : pendingTint))
-                .frame(width: 6, height: 6)
-                .offset(x: 13.2, y: 13.2)
+        HStack(spacing: 0) {
+            metric(
+                title: "30D",
+                value: String(format: "%+.1f%%", periodReturn),
+                tint: periodTint
+            )
+            Divider().frame(height: 20)
+            metric(
+                title: "相对成本",
+                value: costDeviation.map { String(format: "%+.2f%%", $0) } ?? "—",
+                tint: (costDeviation ?? 0) < 0 ? QDesign.negative : QDesign.positive
+            )
+            Divider().frame(height: 20)
+            metric(title: "QQQM P/E", value: valuation, tint: QDesign.secondary)
         }
-        .frame(width: 40, height: 40)
-        .accessibilityLabel(confirmed ? "本周计划已确认" : "本周计划待确认")
+        .accessibilityElement(children: .combine)
+    }
+
+    private func metric(title: String, value: String, tint: Color) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 5) {
+            Text(title)
+                .font(.system(size: 7.5, weight: .medium))
+                .foregroundStyle(QDesign.tertiary)
+            Text(value)
+                .font(.system(size: 9, weight: .semibold, design: .rounded))
+                .foregroundStyle(tint)
+                .monospacedDigit()
+        }
+        .frame(maxWidth: .infinity)
     }
 }
 
-private struct Sparkline: View {
-    let values: [Double]
-    let color: Color
-    var body: some View {
-        GeometryReader { proxy in
-            let minimum = values.min() ?? 0
-            let maximum = values.max() ?? 1
-            let range = max(maximum - minimum, 0.001)
-            Path { path in
-                for index in values.indices {
-                    let x = proxy.size.width * CGFloat(index) / CGFloat(max(values.count - 1, 1))
-                    let y = proxy.size.height * (1 - CGFloat((values[index] - minimum) / range))
-                    index == values.startIndex ? path.move(to: CGPoint(x: x, y: y)) : path.addLine(to: CGPoint(x: x, y: y))
-                }
-            }
-            .stroke(color, style: StrokeStyle(lineWidth: 1.3, lineCap: .round, lineJoin: .round))
-        }
-    }
-}
-
-private struct AllocationBar: View {
-    let qqqm: Double
-    let cash: Double
-
-    var body: some View {
-        GeometryReader { proxy in
-            let qqqm = min(max(qqqm, 0), 1)
-            let cash = min(max(cash, 0), 1 - qqqm)
-            let width = proxy.size.width
-            ZStack(alignment: .leading) {
-                DashboardPalette.otherAssets
-                Rectangle()
-                    .fill(DashboardPalette.accent)
-                    .frame(width: width * qqqm)
-                Rectangle()
-                    .fill(DashboardPalette.green)
-                    .frame(width: width * cash)
-                    .offset(x: width * qqqm)
-                if qqqm > 0 {
-                    Rectangle().fill(DashboardPalette.card).frame(width: 0.7).offset(x: max(0, width * qqqm - 0.35))
-                }
-                if cash > 0 {
-                    Rectangle().fill(DashboardPalette.card).frame(width: 0.7).offset(x: max(0, width * (qqqm + cash) - 0.35))
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-        }
-        .accessibilityLabel("账户资产构成，QQQM \(qqqm * 100, specifier: "%.2f")%，可用资金 \(cash * 100, specifier: "%.2f")%")
-    }
-}
-
-private struct CoverageBlocks: View {
+private struct CashFlowEquation: View {
     let availableFunds: Double
     let planAmount: Double
-
-    private var coverage: Double { planAmount > 0 ? max(0, availableFunds / planAmount) : 0 }
+    private var remainingFunds: Double { max(0, availableFunds - planAmount) }
 
     var body: some View {
-        HStack(spacing: 3) {
-            ForEach(0..<3, id: \.self) { index in
-                GeometryReader { proxy in
-                    let fill = min(max(coverage - Double(index), 0), 1)
-                    ZStack(alignment: .leading) {
-                        RoundedRectangle(cornerRadius: 2, style: .continuous).fill(DashboardPalette.track)
-                        RoundedRectangle(cornerRadius: 2, style: .continuous)
-                            .fill(DashboardPalette.green)
-                            .frame(width: proxy.size.width * fill)
-                    }
-                }
-            }
+        HStack(spacing: 7) {
+            term("可用资金", availableFunds, tint: QDesign.primary)
+            Text("−").foregroundStyle(QDesign.tertiary)
+            term("本期计划", planAmount, tint: QDesign.accent)
+            Text("=").foregroundStyle(QDesign.tertiary)
+            term("计划后可用", remainingFunds, tint: availableFunds >= planAmount ? QDesign.positive : QDesign.caution)
         }
-        .accessibilityLabel("现有可用资金可覆盖 \(coverage, specifier: "%.1f") 期计划")
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("可用资金减去本期计划，按计划测算剩余 \(QFormat.usd(remainingFunds))")
+    }
+
+    private func term(_ title: String, _ amount: Double, tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 7.5, weight: .medium))
+                .foregroundStyle(QDesign.secondary)
+            Text(QFormat.usd(amount))
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .foregroundStyle(tint)
+                .monospacedDigit()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
-private enum TradeDirection: String { case buy, sell }
-
-private struct ChartTradeEvent: Identifiable {
+private struct FreshTradeEvent: Identifiable {
     let id: String
     let date: Date
     let price: Double
@@ -1193,563 +1263,858 @@ private struct ChartTradeEvent: Identifiable {
     let direction: TradeDirection
 }
 
-private func exponentialMovingAverage(_ points: [PricePoint], period: Int) -> [PricePoint] {
-    guard period > 0, let first = points.first else { return [] }
-    let alpha = 2.0 / Double(period + 1)
-    var value = first.close
-    return points.enumerated().map { index, point in
-        if index > 0 { value = point.close * alpha + value * (1 - alpha) }
-        return PricePoint(date: point.date, close: value)
-    }
-}
-
-private struct PositionPriceComparison: View {
-    let averageCost: Double
-    let currentPrice: Double
-
-    private var isAboveCost: Bool { currentPrice >= averageCost }
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 5) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text("平均成本").foregroundStyle(DashboardPalette.muted)
-                Text(averageCost, format: .currency(code: "USD").precision(.fractionLength(2)))
-                    .foregroundStyle(DashboardPalette.text)
-            }
-            Spacer(minLength: 1)
-            Image(systemName: isAboveCost ? "arrow.up.right" : "arrow.down.right")
-                .font(.system(size: 7, weight: .semibold))
-                .foregroundStyle(isAboveCost ? DashboardPalette.green : DashboardPalette.coral)
-            Spacer(minLength: 1)
-            VStack(alignment: .trailing, spacing: 1) {
-                Text("最新价").foregroundStyle(DashboardPalette.muted)
-                Text(currentPrice, format: .currency(code: "USD").precision(.fractionLength(2)))
-                    .foregroundStyle(DashboardPalette.text)
-            }
-        }
-        .font(.system(size: 6.2, weight: .medium, design: .rounded))
-        .monospacedDigit()
-        .padding(.horizontal, 6)
-        .frame(height: 26)
-        .background(DashboardPalette.track.opacity(0.58), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-        .accessibilityLabel("平均成本与当前价格对比")
-    }
-}
-
-struct PriceChartView: View {
+private struct DecisionPriceChart: View {
     let snapshot: QQQMSnapshot
     @State private var selectedDate: Date?
 
     private var ema20: [PricePoint] { exponentialMovingAverage(snapshot.priceHistory, period: 20) }
-
-    private var chartDomain: ClosedRange<Double> {
-        let values = snapshot.priceHistory.map(\.close) + ema20.map(\.close) + tradeEvents.map(\.price)
-        guard let low = values.min(), let high = values.max() else { return 0...1 }
-        let padding = max((high - low) * 0.10, high * 0.004)
-        return (low - padding)...(high + padding)
-    }
     private var dateDomain: ClosedRange<Date> {
         guard let first = snapshot.priceHistory.first?.date, let last = snapshot.priceHistory.last?.date else { return Date()...Date() }
         return first...last
+    }
+    private var yDomain: ClosedRange<Double> {
+        let values = snapshot.priceHistory.map(\.close) + ema20.map(\.close) + tradeEvents.map(\.price)
+        guard let low = values.min(), let high = values.max() else { return 0...1 }
+        let padding = max((high - low) * 0.12, high * 0.004)
+        return (low - padding)...(high + padding)
     }
     private var selectedPoint: PricePoint? {
         guard let selectedDate else { return nil }
         return snapshot.priceHistory.min { abs($0.date.timeIntervalSince(selectedDate)) < abs($1.date.timeIntervalSince(selectedDate)) }
     }
-    private var tradeEvents: [ChartTradeEvent] {
+    private var tradeEvents: [FreshTradeEvent] {
         let markers = snapshot.buyMarkers.filter { dateDomain.contains($0.date) }
         let grouped = Dictionary(grouping: markers) { marker in
-            "\(tradingDay(for: marker.date).timeIntervalSince1970)-\(marker.quantity < 0 ? "sell" : "buy")"
+            let day = Calendar(identifier: .gregorian).startOfDay(for: marker.date)
+            return "\(day.timeIntervalSince1970)-\(marker.quantity < 0 ? "sell" : "buy")"
         }
         return grouped.compactMap { key, values in
             guard let first = values.first else { return nil }
-            let direction: TradeDirection = first.quantity < 0 ? .sell : .buy
-            let totalQuantity = values.reduce(0) { $0 + abs($1.quantity) }
-            let price = totalQuantity > 0 ? values.reduce(0) { $0 + $1.price * abs($1.quantity) } / totalQuantity : first.price
-            return ChartTradeEvent(id: key, date: tradingDay(for: first.date), price: price, count: values.count, direction: direction)
+            let quantity = values.reduce(0) { $0 + abs($1.quantity) }
+            let price = quantity > 0 ? values.reduce(0) { $0 + abs($1.quantity) * $1.price } / quantity : first.price
+            return FreshTradeEvent(id: key, date: first.date, price: price, count: values.count, direction: first.quantity < 0 ? .sell : .buy)
         }.sorted { $0.date < $1.date }
     }
-    private func tradingDay(for date: Date) -> Date {
-        var marketCalendar = Calendar(identifier: .gregorian)
-        marketCalendar.timeZone = TimeZone(identifier: "America/New_York")!
-        let components = marketCalendar.dateComponents([.year, .month, .day], from: date)
-        var utcCalendar = Calendar(identifier: .gregorian)
-        utcCalendar.timeZone = TimeZone(secondsFromGMT: 0)!
-        return utcCalendar.date(from: components) ?? date
-    }
-    private var axisDates: [Date] {
-        let history = snapshot.priceHistory
-        guard !history.isEmpty else { return [] }
-        return [0, history.count / 2, history.count - 1].map { history[$0].date }
-    }
+
     var body: some View {
         Chart {
             ForEach(snapshot.priceHistory) { point in
-                AreaMark(x: .value("日期", point.date), yStart: .value("基线", chartDomain.lowerBound), yEnd: .value("价格", point.close))
-                    .foregroundStyle(
-                        LinearGradient(
-                            colors: [DashboardPalette.blue.opacity(0.20), DashboardPalette.blue.opacity(0.015)],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-                    .interpolationMethod(.catmullRom)
-                LineMark(x: .value("日期", point.date), y: .value("价格", point.close), series: .value("系列", "价格"))
-                    .foregroundStyle(DashboardPalette.blue)
-                    .lineStyle(.init(lineWidth: 1.7, lineCap: .round, lineJoin: .round))
+                AreaMark(
+                    x: .value("日期", point.date),
+                    yStart: .value("基线", yDomain.lowerBound),
+                    yEnd: .value("价格", point.close)
+                )
+                .foregroundStyle(LinearGradient(colors: [QDesign.accent.opacity(0.18), QDesign.accent.opacity(0.01)], startPoint: .top, endPoint: .bottom))
+                .interpolationMethod(.catmullRom)
+
+                LineMark(x: .value("日期", point.date), y: .value("价格", point.close), series: .value("系列", "QQQM"))
+                    .foregroundStyle(QDesign.accent)
+                    .lineStyle(.init(lineWidth: 2, lineCap: .round, lineJoin: .round))
                     .interpolationMethod(.catmullRom)
             }
             ForEach(ema20) { point in
                 LineMark(x: .value("日期", point.date), y: .value("EMA20", point.close), series: .value("系列", "EMA20"))
-                    .foregroundStyle(DashboardPalette.orange.opacity(0.92))
-                    .lineStyle(.init(lineWidth: 1.05, lineCap: .round, lineJoin: .round))
+                    .foregroundStyle(QDesign.secondary.opacity(0.72))
+                    .lineStyle(.init(lineWidth: 1, lineCap: .round, dash: [3, 3]))
                     .interpolationMethod(.catmullRom)
+            }
+            if snapshot.portfolio.averageCost > 0 {
+                RuleMark(y: .value("平均成本", snapshot.portfolio.averageCost))
+                    .foregroundStyle(QDesign.caution.opacity(0.72))
+                    .lineStyle(.init(lineWidth: 0.9, dash: [5, 3]))
+            }
+            ForEach(tradeEvents) { event in
+                PointMark(x: .value("成交日", event.date), y: .value("成交价", event.price))
+                    .symbol {
+                        Text(event.direction == .buy ? "B" : "S")
+                            .font(.system(size: 7, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white)
+                            .frame(width: 15, height: 15)
+                            .background(event.direction == .buy ? QDesign.positive : QDesign.negative, in: Circle())
+                            .overlay(Circle().stroke(Color.white.opacity(0.75), lineWidth: 0.7))
+                            .help("\(event.direction == .buy ? "买入" : "卖出") \(event.count) 笔 · $\(event.price, specifier: "%.2f")")
+                    }
             }
             if let last = snapshot.priceHistory.last {
                 PointMark(x: .value("最新日期", last.date), y: .value("最新价", last.close))
                     .symbol {
-                        Circle().fill(.white).frame(width: 5, height: 5).overlay(Circle().stroke(DashboardPalette.blue, lineWidth: 1.5))
-                    }
-            }
-            ForEach(tradeEvents) { event in
-                PointMark(x: .value("成交日期", event.date), y: .value("成交价格", event.price))
-                    .symbol {
-                        let code = event.direction == .buy ? "B" : "S"
-                        Text(event.count > 1 ? "\(code)×\(event.count)" : code)
-                            .font(.system(size: event.count > 1 ? 5.2 : 5.8, weight: .bold, design: .rounded))
-                            .foregroundStyle(.white)
-                            .frame(width: event.count > 1 ? 20 : 12, height: 12)
-                            .background(event.direction == .buy ? DashboardPalette.green : DashboardPalette.coral, in: Capsule())
-                            .overlay(Capsule().stroke(Color.white.opacity(0.78), lineWidth: 0.7))
-                            .shadow(color: Color.black.opacity(0.18), radius: 1, y: 0.5)
-                            .help("\(event.direction == .buy ? "买入" : "卖出") · \(event.count) 笔 · $\(event.price, specifier: "%.2f")")
+                        Circle().fill(QDesign.surface).frame(width: 8, height: 8)
+                            .overlay(Circle().stroke(QDesign.accent, lineWidth: 2))
                     }
             }
             if let selectedPoint {
                 RuleMark(x: .value("选中日期", selectedPoint.date))
-                    .foregroundStyle(DashboardPalette.muted.opacity(0.55))
-                    .lineStyle(.init(lineWidth: 0.6, dash: [2, 2]))
+                    .foregroundStyle(QDesign.secondary.opacity(0.5))
+                    .lineStyle(.init(lineWidth: 0.7, dash: [2, 2]))
                 PointMark(x: .value("选中日期", selectedPoint.date), y: .value("选中价格", selectedPoint.close))
-                    .foregroundStyle(DashboardPalette.text)
-                    .symbolSize(30)
+                    .foregroundStyle(QDesign.primary)
+                    .symbolSize(28)
                     .annotation(position: .top, spacing: 4) {
-                        HStack(spacing: 3) {
-                            Text(selectedPoint.date, format: .dateTime.month(.defaultDigits).day())
-                            Text(String(format: "$%.2f", selectedPoint.close)).fontWeight(.semibold)
-                        }
-                        .font(.system(size: 6.5, design: .rounded))
-                        .padding(.horizontal, 5).padding(.vertical, 3)
-                        .background(.regularMaterial, in: Capsule())
+                        Text("\(selectedPoint.date.formatted(.dateTime.month(.defaultDigits).day()))  $\(selectedPoint.close, specifier: "%.2f")")
+                            .font(.system(size: 9, weight: .medium, design: .rounded))
+                            .padding(.horizontal, 7).padding(.vertical, 4)
+                            .background(.regularMaterial, in: Capsule())
                     }
             }
         }
-        .chartXScale(domain: dateDomain).chartYScale(domain: chartDomain)
+        .chartXScale(domain: dateDomain)
+        .chartYScale(domain: yDomain)
         .chartLegend(.hidden)
-        .chartXAxis {
-            AxisMarks(values: axisDates) { value in
-                AxisValueLabel(format: .dateTime.month(.defaultDigits).day()).font(.system(size: 6)).foregroundStyle(DashboardPalette.muted)
-            }
-        }
-        .chartYAxis {
-            AxisMarks(position: .trailing, values: .automatic(desiredCount: 3)) { value in
-                AxisGridLine(stroke: StrokeStyle(lineWidth: 0.35, dash: [2, 3])).foregroundStyle(DashboardPalette.border.opacity(0.55))
-                AxisValueLabel { if let price = value.as(Double.self) { Text(String(format: "%.0f", price)) } }.font(.system(size: 6)).foregroundStyle(DashboardPalette.muted)
-            }
-        }
-        .chartPlotStyle { plot in
-            plot.background(Color.clear)
-        }
+        .chartXAxis(.hidden)
+        .chartYAxis(.hidden)
         .chartXSelection(value: $selectedDate)
-        .accessibilityLabel("QQQM 最近 30 个交易日收盘价、EMA20 趋势与成交点")
+        .accessibilityLabel("QQQM 最近三十个交易日收盘价、二十日指数均线与真实成交点")
     }
 }
 
-private struct DashboardMetric: View {
+private struct EvidenceChip: View {
     let title: String
     let value: String
-    let subtitle: String
     let tint: Color
-    let spark: [Double]
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.system(size: 7, weight: .medium)).foregroundStyle(DashboardPalette.muted)
-            HStack(alignment: .firstTextBaseline, spacing: 2) { Text(value).font(.system(size: 10, weight: .semibold, design: .rounded)).foregroundStyle(DashboardPalette.text); Image(systemName: title == "趋势" ? "arrow.up.right" : "waveform.path.ecg").font(.system(size: 8, weight: .bold)).foregroundStyle(tint) }
-            Text(subtitle).font(.system(size: 7)).foregroundStyle(DashboardPalette.muted).lineLimit(1).minimumScaleFactor(0.75)
-            Sparkline(values: spark, color: tint).frame(height: 16)
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 4) {
+                Circle().fill(tint).frame(width: 5, height: 5)
+                Text(title).foregroundStyle(QDesign.secondary)
+            }
+            Text(value)
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .foregroundStyle(QDesign.primary)
+                .lineLimit(1).minimumScaleFactor(0.78)
+        }
+        .font(.system(size: 9, weight: .medium))
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct AllocationStepScale: View {
+    let selectedAmount: Double
+    private let amounts = [200.0, 300.0, 400.0, 500.0, 600.0]
+
+    var body: some View {
+        VStack(spacing: 5) {
+            ZStack {
+                Capsule().fill(QDesign.separator.opacity(0.72)).frame(height: 2)
+                HStack(spacing: 0) {
+                    ForEach(amounts, id: \.self) { amount in
+                        let selected = abs(amount - selectedAmount) < 0.1
+                        ZStack {
+                            Circle()
+                                .fill(selected ? QDesign.accent : QDesign.surface)
+                                .frame(width: selected ? 13 : 8, height: selected ? 13 : 8)
+                                .overlay(Circle().stroke(selected ? QDesign.accent : QDesign.secondary.opacity(0.65), lineWidth: 1))
+                            if selected { Circle().fill(.white).frame(width: 4, height: 4) }
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                }
+            }
+            HStack(spacing: 0) {
+                ForEach(amounts, id: \.self) { amount in
+                    Text("$\(Int(amount))")
+                        .font(.system(size: 8.5, weight: abs(amount - selectedAmount) < 0.1 ? .semibold : .regular, design: .rounded))
+                        .foregroundStyle(abs(amount - selectedAmount) < 0.1 ? QDesign.accent : QDesign.secondary)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+        }
+        .accessibilityLabel("定投五档金额，当前选择 \(selectedAmount, specifier: "%.0f") 美元")
+    }
+}
+
+private struct FactorConditionRow: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let title: String
+    let value: String
+    let source: String
+    let position: Double
+    let status: String
+    let tint: Color
+    let lowTint: Color
+    let highTint: Color
+    let lowerBoundary: Double
+    let upperBoundary: Double
+
+    private var clamped: Double { min(max(position, 0), 1) }
+    private var lowBoundary: Double { min(max(lowerBoundary, 0.08), 0.84) }
+    private var highBoundary: Double { min(max(upperBoundary, lowBoundary + 0.08), 0.92) }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.system(size: 9, weight: .medium))
+                Text(source).font(.system(size: 7.5)).foregroundStyle(QDesign.tertiary).lineLimit(1)
+            }
+            .frame(width: 72, alignment: .leading)
+
+            GeometryReader { proxy in
+                let availableWidth = max(0, proxy.size.width - 2)
+                ZStack(alignment: .leading) {
+                    HStack(spacing: 1) {
+                        Rectangle().fill(lowTint.opacity(colorScheme == .dark ? 0.34 : 0.24))
+                            .frame(width: availableWidth * lowBoundary)
+                        Rectangle().fill(QDesign.track)
+                            .frame(width: availableWidth * (highBoundary - lowBoundary))
+                        Rectangle().fill(highTint.opacity(colorScheme == .dark ? 0.34 : 0.24))
+                    }
+                    .frame(height: 5)
+                    .clipShape(Capsule())
+                    Circle().fill(tint).frame(width: 9, height: 9)
+                        .overlay(Circle().stroke(QDesign.elevated, lineWidth: 1.5))
+                        .shadow(color: tint.opacity(0.22), radius: 2)
+                        .offset(x: max(0, min(proxy.size.width - 9, proxy.size.width * clamped - 4.5)))
+                }
+                .frame(maxHeight: .infinity)
+            }
+            .frame(height: 10)
+
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(value).font(.system(size: 9.5, weight: .semibold, design: .rounded)).monospacedDigit()
+                Text(status).font(.system(size: 7.5, weight: .medium)).foregroundStyle(tint)
+            }
+            .frame(width: 66, alignment: .trailing)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct TierTransitionView: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let moreDetail: String
+    let lessDetail: String
+    let moreReached: Bool
+    let lessReached: Bool
+
+    var body: some View {
+        HStack(spacing: 0) {
+            transition(
+                amount: "$500",
+                title: moreReached ? "升档条件已满足" : "升档还差",
+                logic: "任一项",
+                detail: moreDetail,
+                tint: QDesign.positive
+            )
+            Divider().padding(.vertical, 1)
+            transition(
+                amount: "$300",
+                title: lessReached ? "降档条件已满足" : "降档还缺",
+                logic: "全部项",
+                detail: lessDetail,
+                tint: QDesign.caution
+            )
+        }
+        .padding(.vertical, 7)
+        .background {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            QDesign.positive.opacity(colorScheme == .dark ? 0.075 : 0.045),
+                            QDesign.caution.opacity(colorScheme == .dark ? 0.065 : 0.038)
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(QDesign.separator.opacity(0.42), lineWidth: 0.5)
+        }
+    }
+
+    private func transition(amount: String, title: String, logic: String, detail: String, tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 5) {
+                Text(amount)
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(tint)
+                Text(title).font(.system(size: 8.5, weight: .medium))
+                Spacer(minLength: 2)
+                Text(logic)
+                    .font(.system(size: 6.5, weight: .bold))
+                    .foregroundStyle(tint)
+                    .padding(.horizontal, 4).padding(.vertical, 1)
+                    .background(tint.opacity(0.11), in: Capsule())
+            }
+            Text(detail)
+                .font(.system(size: 7.5, design: .rounded))
+                .foregroundStyle(QDesign.secondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .fixedSize(horizontal: false, vertical: true)
-        .clipped()
+        .padding(.horizontal, 8)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct FundsCoverageRail: View {
+    let availableFunds: Double
+    let planAmount: Double
+    private var coverage: Double { planAmount > 0 ? max(0, availableFunds / planAmount) : 0 }
+    private var remainingFunds: Double { max(0, availableFunds - planAmount) }
+    private var remainingCoverage: Double { planAmount > 0 ? remainingFunds / planAmount : 0 }
+
+    var body: some View {
+        VStack(spacing: 4) {
+            HStack(spacing: 4) {
+                ForEach(0..<4, id: \.self) { index in
+                    GeometryReader { proxy in
+                        let fill = min(max(coverage - Double(index), 0), 1)
+                        ZStack(alignment: .leading) {
+                            RoundedRectangle(cornerRadius: 2.5, style: .continuous).fill(QDesign.track)
+                            RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+                                .fill(index == 0 ? QDesign.accent : QDesign.positive)
+                                .frame(width: proxy.size.width * fill)
+                        }
+                    }
+                }
+            }
+            .frame(height: 6)
+            HStack {
+                if availableFunds >= planAmount {
+                    Text("本期预留 \(QFormat.usd(planAmount)) · 剩余 \(QFormat.usd(remainingFunds))")
+                } else {
+                    Text("本期资金缺口 \(QFormat.usd(planAmount - availableFunds))")
+                        .foregroundStyle(QDesign.caution)
+                }
+                Spacer()
+                Text("后续 \(remainingCoverage, specifier: "%.1f") 期")
+            }
+            .font(.system(size: 8, design: .rounded)).foregroundStyle(QDesign.secondary)
+        }
+        .accessibilityLabel("可用资金共覆盖 \(coverage, specifier: "%.1f") 期；预留本期后还可覆盖 \(remainingCoverage, specifier: "%.1f") 期")
+    }
+}
+
+private struct ThresholdRuleRow: View {
+    let amount: String
+    let title: String
+    let logic: String
+    let conditions: String
+    let tint: Color
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(amount)
+                .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                .foregroundStyle(tint)
+                .frame(width: 34, alignment: .leading)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 5) {
+                    Text(title).font(.system(size: 8.5, weight: .medium))
+                    Text(logic).font(.system(size: 7, weight: .bold))
+                        .padding(.horizontal, 4).padding(.vertical, 1)
+                        .foregroundStyle(tint)
+                        .background(tint.opacity(0.10), in: Capsule())
+                }
+                Text(conditions).font(.system(size: 7.5)).foregroundStyle(QDesign.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
 struct MenuPopoverView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.colorScheme) private var colorScheme
+    @State private var showFullRules = false
+    private let previewExpanded: Bool
+
+    init(initialRuleDisclosure: Bool = false) {
+        previewExpanded = initialRuleDisclosure
+        _showFullRules = State(initialValue: initialRuleDisclosure)
+    }
+
+    private var resolvedHeight: CGFloat {
+#if QQQMBAR_RENDER_TEST
+        previewExpanded ? 950 : DashboardLayout.height
+#else
+        DashboardLayout.height
+#endif
+    }
+
     var body: some View {
-        Group { if let snapshot = model.snapshot { content(snapshot) } else { unavailable } }
-            .padding(7).frame(width: DashboardLayout.width, height: DashboardLayout.height)
-            .background {
-                ZStack {
-                    DashboardPalette.background
-                    RadialGradient(
-                        colors: [DashboardPalette.accent.opacity(colorScheme == .light ? 0.07 : 0.09), .clear],
-                        center: .topTrailing,
-                        startRadius: 0,
-                        endRadius: 310
-                    )
-                }
+        Group {
+            if let snapshot = model.snapshot { content(snapshot) }
+            else { unavailable }
+        }
+        .padding(10)
+        .frame(width: DashboardLayout.width, height: resolvedHeight, alignment: .top)
+        .background {
+            ZStack {
+                QDesign.background
+                Rectangle().fill(.ultraThinMaterial)
+                RadialGradient(
+                    colors: [QDesign.accent.opacity(colorScheme == .dark ? 0.075 : 0.045), .clear],
+                    center: .topLeading,
+                    startRadius: 0,
+                    endRadius: 320
+                )
             }
-            .onAppear {
-                model.reload()
-            }
+        }
+        .foregroundStyle(QDesign.primary)
+        .onAppear { model.reload() }
     }
 
     private func content(_ snapshot: QQQMSnapshot) -> some View {
-        VStack(spacing: 4) {
-            header(snapshot)
-            chartPanel(snapshot)
-            signalPanel(snapshot)
-            overviewPanels(snapshot)
-            bottomPanels(snapshot)
-            confirmationButton(snapshot)
-        }
-        .foregroundStyle(DashboardPalette.text)
-        .frame(maxHeight: .infinity, alignment: .top)
-    }
-
-    private func header(_ snapshot: QQQMSnapshot) -> some View {
-        HStack(spacing: 4) {
-            RingBadge(confirmed: model.planConfirmed, isRefreshing: model.isRefreshing, pendingTint: recommendationTint(snapshot.recommendation.kind))
-            VStack(alignment: .leading, spacing: 1) {
-                Text("本周计划金额").font(.system(size: 7)).foregroundStyle(DashboardPalette.muted)
-                Text(usd(snapshot.recommendation.recommendedAmount)).font(.system(size: 19, weight: .semibold, design: .rounded)).monospacedDigit()
-                HStack(spacing: 3) { Text(snapshot.recommendation.kind.label).foregroundStyle(recommendationTint(snapshot.recommendation.kind)); Text("\(snapshot.recommendation.multiplier, specifier: "%.2f")×").foregroundStyle(DashboardPalette.muted) }.font(.system(size: 7, weight: .medium))
-                    .help(snapshot.recommendation.explanation)
-            }
-            .frame(width: 72, alignment: .leading)
-            Divider().overlay(DashboardPalette.border).frame(height: 36)
-            VStack(spacing: 1) {
-                Text("计划执行").font(.system(size: 7)).foregroundStyle(DashboardPalette.muted)
-                Text(compactDays(snapshot.recommendation.nextExecution)).font(.system(size: 10, weight: .medium))
-                Text(snapshot.recommendation.nextExecution, format: .dateTime.month(.defaultDigits).day()).font(.system(size: 7)).foregroundStyle(DashboardPalette.muted)
-            }.frame(width: 46)
-            Divider().overlay(DashboardPalette.border).frame(height: 36)
-            Image(systemName: model.planConfirmed ? "checkmark" : "clock").font(.system(size: 14, weight: .bold)).foregroundStyle(model.planConfirmed ? DashboardPalette.green : recommendationTint(snapshot.recommendation.kind)).frame(width: 27, height: 27).background((model.planConfirmed ? DashboardPalette.green : recommendationTint(snapshot.recommendation.kind)).opacity(0.14), in: Circle())
-            VStack(alignment: .leading, spacing: 1) {
-                Text(model.planConfirmed ? "计划已确认" : "等待确认").font(.system(size: 8, weight: .medium)).lineLimit(1)
-                Text("只确认 · 不下单").font(.system(size: 6)).foregroundStyle(DashboardPalette.muted).lineLimit(1)
-            }.frame(width: 58, alignment: .leading)
+        VStack(spacing: 8) {
 #if QQQMBAR_RENDER_TEST
-            Image(systemName: "ellipsis").font(.system(size: 11, weight: .bold)).frame(width: 12, height: 24)
+            decisionDocument(snapshot)
 #else
-            Menu { Button("立即刷新市场数据") { Task { await model.refreshMarketData(force: true) } }; if model.planConfirmed { Button("重新打开本周计划") { model.reopenPlan() } }; Button("打开数据文件夹") { model.openDataFolder() }; SettingsLink { Text("设置") }; Divider(); Button("退出 QQQMBar") { NSApplication.shared.terminate(nil) } } label: { Image(systemName: "ellipsis").font(.system(size: 11, weight: .bold)).frame(width: 12, height: 24) }.menuStyle(.borderlessButton)
+            ScrollView(.vertical) {
+                decisionDocument(snapshot).padding(.bottom, 1)
+            }
+            .scrollIndicators(.hidden)
 #endif
+            footer(snapshot)
         }
-        .frame(height: 56)
     }
 
-    private func chartPanel(_ snapshot: QQQMSnapshot) -> some View {
-        DashboardCard(tint: DashboardPalette.cyan) {
-            VStack(spacing: 5) {
-                HStack(alignment: .firstTextBaseline) {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("QQQM · 近 30 个交易日").font(.system(size: 10.5, weight: .semibold))
-                        Text(snapshot.source.mode == .live ? "NASDAQ 收盘价" : "本地行情快照").font(.system(size: 6.3)).foregroundStyle(DashboardPalette.muted)
+    private func decisionDocument(_ snapshot: QQQMSnapshot) -> some View {
+        QDecisionCanvas {
+            VStack(spacing: 0) {
+                decisionHeader(snapshot)
+                sectionDivider
+                marketPanel(snapshot)
+                sectionDivider
+                evidencePanel(snapshot)
+                sectionDivider
+                portfolioPanel(snapshot)
+            }
+        }
+    }
+
+    private var sectionDivider: some View {
+        Rectangle()
+            .fill(QDesign.separator.opacity(0.82))
+            .frame(height: 0.65)
+            .padding(.horizontal, QDesign.sectionPadding)
+    }
+
+    private func decisionHeader(_ snapshot: QQQMSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .top, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("本期分档计划")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(QDesign.secondary)
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text(usd(snapshot.recommendation.recommendedAmount))
+                                .font(.system(size: 27, weight: .semibold, design: .rounded))
+                                .monospacedDigit()
+                            Text("\(snapshot.recommendation.multiplier, specifier: "%.2f")×")
+                                .font(.system(size: 11, weight: .medium, design: .rounded))
+                                .foregroundStyle(recommendationTint(snapshot.recommendation.kind))
+                        }
                     }
                     Spacer()
-                    VStack(alignment: .trailing, spacing: 1) {
-                        Text(usd(snapshot.quote.lastPrice, decimals: 2)).font(.system(size: 14, weight: .semibold, design: .rounded)).monospacedDigit()
-                        Text(snapshot.quote.dayChangePct / 100, format: .percent.precision(.fractionLength(2))).font(.system(size: 7, weight: .semibold, design: .rounded))
-                            .foregroundStyle(snapshot.quote.dayChangePct >= 0 ? DashboardPalette.green : DashboardPalette.coral)
+                    VStack(alignment: .trailing, spacing: 3) {
+                        statusPill(snapshot)
+                        Text(executionLabel(snapshot.recommendation.nextExecution))
+                            .font(.system(size: 10, weight: .medium))
+                        Text(snapshot.recommendation.nextExecution, format: .dateTime.month(.abbreviated).day().weekday(.abbreviated))
+                            .font(.system(size: 9)).foregroundStyle(QDesign.secondary)
+                    }
+#if QQQMBAR_RENDER_TEST
+                    Image(systemName: "ellipsis").font(.system(size: 12, weight: .semibold)).frame(width: 16, height: 24)
+#else
+                    Menu {
+                        Button("立即刷新市场数据") { Task { await model.refreshMarketData(force: true) } }
+                        if model.planConfirmed { Button("重新打开本期计划") { model.reopenPlan() } }
+                        Button("打开数据文件夹") { model.openDataFolder() }
+                        SettingsLink { Text("设置") }
+                        Divider()
+                        Button("退出 QQQMBar") { NSApplication.shared.terminate(nil) }
+                    } label: {
+                        Image(systemName: "ellipsis").font(.system(size: 12, weight: .semibold)).frame(width: 16, height: 24)
+                    }
+                    .menuStyle(.borderlessButton)
+#endif
+                }
+                Text(decisionSummary(snapshot))
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(QDesign.secondary)
+                    .lineLimit(1)
+                AllocationStepScale(selectedAmount: snapshot.recommendation.recommendedAmount)
+        }
+        .padding(12)
+    }
+
+    private func marketPanel(_ snapshot: QQQMSnapshot) -> some View {
+        VStack(spacing: 7) {
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("QQQM · 市场位置")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text("近 30 个交易日")
+                            .font(.system(size: 9)).foregroundStyle(QDesign.secondary)
+                    }
+                    Spacer()
+                    Text(usd(snapshot.quote.lastPrice, decimals: 2))
+                        .font(.system(size: 17, weight: .semibold, design: .rounded)).monospacedDigit()
+                    Text(snapshot.quote.dayChangePct / 100, format: .percent.precision(.fractionLength(2)))
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .foregroundStyle(snapshot.quote.dayChangePct >= 0 ? QDesign.positive : QDesign.negative)
+                }
+                QuoteContextStrip(
+                    periodReturn: periodReturn(snapshot),
+                    periodTint: trendTint(snapshot),
+                    costDeviation: costDeviation(snapshot),
+                    valuation: signal(snapshot, 3).value
+                )
+                DecisionPriceChart(snapshot: snapshot).frame(height: 118)
+                HStack {
+                    Text(snapshot.priceHistory.first?.date ?? snapshot.lastUpdated, format: .dateTime.month(.defaultDigits).day())
+                    Spacer()
+                    Text("拖动图表查看收盘价")
+                    Spacer()
+                    Text(snapshot.priceHistory.last?.date ?? snapshot.lastUpdated, format: .dateTime.month(.defaultDigits).day())
+                }
+                .font(.system(size: 8.5)).foregroundStyle(QDesign.tertiary)
+                HStack(spacing: 12) {
+                    chartLegend(color: QDesign.accent, label: "收盘价")
+                    chartLegend(color: QDesign.secondary, label: "EMA20", dashed: true)
+                    chartLegend(color: QDesign.caution, label: "成本 \(usd(snapshot.portfolio.averageCost, decimals: 2))", dashed: true)
+                    Spacer()
+                    Text("B \(snapshot.buyMarkers.filter { $0.quantity > 0 }.count)")
+                        .foregroundStyle(QDesign.positive)
+                    Text("S \(snapshot.buyMarkers.filter { $0.quantity < 0 }.count)")
+                        .foregroundStyle(QDesign.negative)
+                }
+                .font(.system(size: 9, weight: .medium, design: .rounded))
+        }
+        .padding(12)
+    }
+
+    private func evidencePanel(_ snapshot: QQQMSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("本期为什么是 \(usd(snapshot.recommendation.recommendedAmount))")
+                        .font(.system(size: 10, weight: .semibold))
+                    Spacer()
+                    HStack(spacing: 5) {
+                        Text("多投 OR \(moreTriggerCount(snapshot))/3")
+                            .foregroundStyle(moreTriggerCount(snapshot) > 0 ? QDesign.positive : QDesign.secondary)
+                        Text("·")
+                        Text("少投 AND \(lessTriggerCount(snapshot))/3")
+                            .foregroundStyle(lessTriggerCount(snapshot) == 3 ? QDesign.caution : QDesign.secondary)
+                    }
+                    .font(.system(size: 7.5, weight: .medium)).foregroundStyle(QDesign.secondary)
+                }
+                FactorConditionRow(
+                    title: "30 日趋势",
+                    value: signal(snapshot, 0).value,
+                    source: standardTrendThresholds,
+                    position: trendPosition(snapshot),
+                    status: trendStatus(snapshot),
+                    tint: trendTint(snapshot),
+                    lowTint: QDesign.positive,
+                    highTint: QDesign.caution,
+                    lowerBoundary: 0.20,
+                    upperBoundary: 0.72
+                )
+                FactorConditionRow(
+                    title: "市场波动",
+                    value: signal(snapshot, 1).value,
+                    source: standardVIXThresholds,
+                    position: vixPosition(snapshot),
+                    status: vixStatus(snapshot),
+                    tint: vixTint(snapshot),
+                    lowTint: QDesign.caution,
+                    highTint: QDesign.positive,
+                    lowerBoundary: 4.0 / 14.0,
+                    upperBoundary: 7.0 / 14.0
+                )
+                FactorConditionRow(
+                    title: "CNN 情绪",
+                    value: String(format: "%.1f", sentimentValue(snapshot)),
+                    source: standardSentimentThresholds,
+                    position: sentimentPosition(snapshot),
+                    status: sentimentStatus(snapshot),
+                    tint: sentimentTint(snapshot),
+                    lowTint: QDesign.positive,
+                    highTint: QDesign.caution,
+                    lowerBoundary: 0.30,
+                    upperBoundary: 0.80
+                )
+                TierTransitionView(
+                    moreDetail: moreTransitionDetail(snapshot),
+                    lessDetail: lessTransitionDetail(snapshot),
+                    moreReached: moreTriggerCount(snapshot) > 0,
+                    lessReached: lessTriggerCount(snapshot) == 3
+                )
+                DisclosureGroup(isExpanded: $showFullRules) {
+                    VStack(spacing: 6) {
+                        Divider()
+                        ThresholdRuleRow(amount: "$600", title: "明显多投", logic: "OR", conditions: strongMoreConditions, tint: QDesign.positive)
+                        ThresholdRuleRow(amount: "$500", title: "适度多投", logic: "OR", conditions: moreConditions, tint: QDesign.positive)
+                        ThresholdRuleRow(amount: "$300", title: "适度少投", logic: "AND", conditions: lessConditions, tint: QDesign.caution)
+                        ThresholdRuleRow(amount: "$200", title: "明显少投", logic: "AND", conditions: strongLessConditions, tint: QDesign.caution)
+                        Text("分档规则用于保持纪律，不是收益预测，也不会自动下单。")
+                            .font(.system(size: 7.5)).foregroundStyle(QDesign.tertiary)
+                    }
+                    .padding(.top, 3)
+                } label: {
+                    HStack {
+                        Text("完整五档规则")
+                        Spacer()
+                        Text(showFullRules ? "收起" : "查看门槛")
+                            .foregroundStyle(QDesign.secondary)
+                    }
+                    .font(.system(size: 8.5, weight: .medium))
+                }
+                .tint(QDesign.secondary)
+        }
+        .padding(12)
+    }
+
+    private func portfolioPanel(_ snapshot: QQQMSnapshot) -> some View {
+        VStack(spacing: 8) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("账户与执行").font(.system(size: 10, weight: .semibold))
+                        Text("只读快照 · 按当前计划测算").font(.system(size: 7.5)).foregroundStyle(QDesign.tertiary)
+                    }
+                    Spacer()
+                    if snapshot.source.accountSource != nil {
+                        Label("IBKR 只读", systemImage: "checkmark.shield.fill")
+                            .font(.system(size: 8, weight: .medium))
+                            .foregroundStyle(QDesign.positive)
                     }
                 }
-                HStack(spacing: 10) {
-                    seriesLegend("价格", DashboardPalette.cyan)
-                    seriesLegend("EMA20", DashboardPalette.orange)
-                    tradeLegend("B", "买入 \(snapshot.buyMarkers.filter { $0.quantity > 0 }.count)", DashboardPalette.green)
-                    tradeLegend("S", "卖出 \(snapshot.buyMarkers.filter { $0.quantity < 0 }.count)", DashboardPalette.coral)
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(String(format: "%.4f 股 QQQM", snapshot.portfolio.shares))
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        Text("市值 \(usd(snapshot.verifiedMarketValue))")
+                            .font(.system(size: 8)).foregroundStyle(QDesign.secondary)
+                    }
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(costRelationship(snapshot))
+                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                            .foregroundStyle(costRelationshipTint(snapshot))
+                        Text("未实现 \(signedUSD(snapshot.verifiedUnrealizedPnL)) · \(percent(unrealizedPercent(snapshot)))")
+                            .font(.system(size: 8, design: .rounded))
+                            .foregroundStyle(snapshot.verifiedUnrealizedPnL >= 0 ? QDesign.positive : QDesign.negative)
+                    }
                 }
-                .font(.system(size: 6.2, weight: .medium))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                PriceChartView(snapshot: snapshot).frame(height: 110)
-                HStack(spacing: 0) {
-                    chartStat("区间低点", periodLow(snapshot), DashboardPalette.muted)
-                    Divider().overlay(DashboardPalette.border)
-                    chartStat("区间高点", periodHigh(snapshot), DashboardPalette.muted)
-                    Divider().overlay(DashboardPalette.border)
-                    chartStat("30 日涨跌", percent(periodReturn(snapshot)), periodReturn(snapshot) >= 0 ? DashboardPalette.green : DashboardPalette.coral)
+                Divider()
+                CashFlowEquation(
+                    availableFunds: snapshot.portfolio.availableFunds,
+                    planAmount: snapshot.recommendation.recommendedAmount
+                )
+                FundsCoverageRail(availableFunds: snapshot.portfolio.availableFunds, planAmount: snapshot.recommendation.recommendedAmount)
+        }
+        .padding(12)
+    }
+
+    private func footer(_ snapshot: QQQMSnapshot) -> some View {
+        let status = dataStatus(snapshot)
+        return HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    Image(systemName: status.icon).foregroundStyle(status.tint)
+                    Text(status.title)
                 }
-                .frame(height: 26)
+                .font(.system(size: 9, weight: .medium))
+                Text(status.detail)
+                    .font(.system(size: 8)).foregroundStyle(QDesign.secondary)
+            }
+            .help(model.marketError ?? status.detail)
+            Spacer()
+            if model.planConfirmed {
+                Label("已确认", systemImage: "checkmark.circle.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(QDesign.positive)
+                    .frame(width: 128, height: 34)
+                    .background(QDesign.positive.opacity(0.12), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            } else {
+                Button { model.confirmPlan() } label: {
+                    Label("确认计划 \(usd(snapshot.recommendation.recommendedAmount))", systemImage: "checkmark.circle")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 128, height: 34)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .tint(QDesign.accent)
+                .keyboardShortcut(.return, modifiers: [])
+                .help("仅保存本地确认记录，不会创建或提交交易订单。")
             }
         }
-        .frame(height: 202).clipped()
+        .padding(.horizontal, 2)
     }
 
-    private func signalPanel(_ snapshot: QQQMSnapshot) -> some View {
-        return DashboardCard(tint: DashboardPalette.steel) {
-            HStack(spacing: 0) {
-                signalTile(signal(snapshot, at: 0), tint: DashboardPalette.green).frame(width: 76)
-                Divider().overlay(DashboardPalette.border)
-                signalTile(signal(snapshot, at: 1), tint: DashboardPalette.orange).frame(width: 76)
-                Divider().overlay(DashboardPalette.border)
-                fearGreedTile(signal(snapshot, at: 2)).frame(width: 76)
-                Divider().overlay(DashboardPalette.border)
-                signalTile(signal(snapshot, at: 3), tint: DashboardPalette.blue).frame(width: 76)
-            }
+    private func dataStatus(_ snapshot: QQQMSnapshot) -> (icon: String, title: String, detail: String, tint: Color) {
+        let sourceDates = "行情 \(shortDate(snapshot.source.asOf)) · 账户 \(shortDate(snapshot.source.accountAsOf ?? snapshot.source.asOf))"
+        if model.isRefreshing {
+            return ("arrow.triangle.2.circlepath", "正在更新市场数据", "上一份快照仍可安全使用", QDesign.accent)
         }
-        .frame(height: 76).clipped()
+        if model.marketError != nil {
+            return ("arrow.clockwise.circle.fill", "更新失败 · 已保留有效快照", sourceDates, QDesign.caution)
+        }
+        if !snapshot.auditIssues.isEmpty {
+            return ("exclamationmark.triangle.fill", "数据校验发现差异", "\(snapshot.auditIssues.count) 项需检查 · \(sourceDates)", QDesign.caution)
+        }
+        return ("checkmark.seal.fill", "数据已校验", sourceDates, QDesign.positive)
     }
 
-    private func overviewPanels(_ snapshot: QQQMSnapshot) -> some View {
-        let p = snapshot.portfolio
-        return HStack(alignment: .top, spacing: 4) {
-            DashboardCard(tint: DashboardPalette.green) {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("QQQM 持仓").font(.system(size: 9, weight: .medium))
-                        Spacer()
-                        Text(percent(unrealizedPercent(snapshot)))
-                            .font(.system(size: 7, weight: .semibold, design: .rounded))
-                            .foregroundStyle(snapshot.verifiedUnrealizedPnL >= 0 ? DashboardPalette.green : DashboardPalette.coral)
-                            .padding(.horizontal, 5).padding(.vertical, 2)
-                            .background((snapshot.verifiedUnrealizedPnL >= 0 ? DashboardPalette.green : DashboardPalette.coral).opacity(0.14), in: Capsule())
-                    }
-                    HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(String(format: "%.4f 股", p.shares)).font(.system(size: 11, weight: .semibold, design: .rounded)).monospacedDigit()
-                            Text("市值 \(usd(snapshot.verifiedMarketValue))").font(.system(size: 6.5)).foregroundStyle(DashboardPalette.muted)
-                        }
-                        Spacer(minLength: 2)
-                        VStack(alignment: .trailing, spacing: 1) {
-                            Text("未实现").font(.system(size: 6)).foregroundStyle(DashboardPalette.muted)
-                            Text(signedUSD(snapshot.verifiedUnrealizedPnL)).font(.system(size: 8, weight: .semibold, design: .rounded))
-                        }
-                        .foregroundStyle(snapshot.verifiedUnrealizedPnL >= 0 ? DashboardPalette.green : DashboardPalette.coral)
-                    }
-                    PositionPriceComparison(averageCost: p.averageCost, currentPrice: snapshot.quote.lastPrice)
-                }
-            }.frame(width: DashboardLayout.halfCardWidth, height: 104).clipped()
-            DashboardCard(tint: DashboardPalette.steel) {
-                let qqqmWeight = snapshot.verifiedPositionWeight
-                let cashWeight = snapshot.verifiedAvailableFundsWeight
-                let otherWeight = max(0, 1 - qqqmWeight - cashWeight)
-                let otherValue = max(0, snapshot.verifiedNAV - snapshot.verifiedMarketValue - snapshot.portfolio.availableFunds)
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack {
-                        Text("账户资产构成").font(.system(size: 9, weight: .medium))
-                        Spacer()
-                        if snapshot.source.accountSource != nil {
-                            Text("IBKR").font(.system(size: 5.8, weight: .bold)).foregroundStyle(DashboardPalette.green)
-                                .padding(.horizontal, 5).padding(.vertical, 2)
-                                .background(DashboardPalette.green.opacity(0.13), in: Capsule())
-                        }
-                    }
-                    HStack {
-                        Text("账户 NAV").foregroundStyle(DashboardPalette.muted)
-                        Spacer()
-                        Text(usd(snapshot.verifiedNAV, decimals: 2)).font(.system(size: 8.3, weight: .semibold, design: .rounded))
-                    }.font(.system(size: 6.5))
-                    AllocationBar(qqqm: qqqmWeight, cash: cashWeight).frame(height: 7)
-                    allocationRow("QQQM", value: snapshot.verifiedMarketValue, weight: qqqmWeight, tint: DashboardPalette.accent)
-                    allocationRow("可用资金", value: snapshot.portfolio.availableFunds, weight: cashWeight, tint: DashboardPalette.green)
-                    allocationRow("其他资产", value: otherValue, weight: otherWeight, tint: DashboardPalette.otherAssets)
-                }
-            }.frame(width: DashboardLayout.halfCardWidth, height: 104).clipped()
+    private func statusPill(_ snapshot: QQQMSnapshot) -> some View {
+        Label(model.planConfirmed ? "已确认" : snapshot.recommendation.kind.label, systemImage: model.planConfirmed ? "checkmark.circle.fill" : "calendar.badge.clock")
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundStyle(model.planConfirmed ? QDesign.positive : recommendationTint(snapshot.recommendation.kind))
+            .padding(.horizontal, 7).padding(.vertical, 4)
+            .background((model.planConfirmed ? QDesign.positive : recommendationTint(snapshot.recommendation.kind)).opacity(0.11), in: Capsule())
+    }
+
+    private func chartLegend(color: Color, label: String, dashed: Bool = false) -> some View {
+        HStack(spacing: 4) {
+            Capsule().fill(color).frame(width: dashed ? 4 : 12, height: 2)
+            if dashed { Capsule().fill(color).frame(width: 4, height: 2) }
+            Text(label).foregroundStyle(QDesign.secondary)
         }
     }
 
-    private func bottomPanels(_ snapshot: QQQMSnapshot) -> some View {
-        let p = snapshot.portfolio
-        return HStack(alignment: .top, spacing: 4) {
-            DashboardCard(tint: DashboardPalette.green) {
-                let planAmount = max(snapshot.recommendation.recommendedAmount, 0.01)
-                let coverage = p.availableFunds / planAmount
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("计划资金").font(.system(size: 8, weight: .medium))
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(String(format: "%.1f 期", coverage)).font(.system(size: 12, weight: .semibold, design: .rounded))
-                        Spacer(minLength: 2)
-                        Text(usd(p.availableFunds)).font(.system(size: 7, weight: .medium, design: .rounded)).foregroundStyle(DashboardPalette.muted)
-                    }
-                    Text("按本期 \(usd(planAmount)) 计算").font(.system(size: 6)).foregroundStyle(DashboardPalette.muted)
-                    CoverageBlocks(availableFunds: p.availableFunds, planAmount: planAmount).frame(height: 8)
-                }
-            }.frame(width: DashboardLayout.thirdCardWidth)
-            DashboardCard(tint: DashboardPalette.orange) { contributionHistory(snapshot) }.frame(width: DashboardLayout.thirdCardWidth)
-            DashboardCard(tint: DashboardPalette.cyan) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("数据状态").font(.system(size: 8, weight: .medium))
-                    HStack(spacing: 3) {
-                        if model.isRefreshing { ProgressView().controlSize(.mini) }
-                        else { Image(systemName: snapshot.auditIssues.isEmpty ? "checkmark.circle.fill" : "exclamationmark.circle.fill").foregroundStyle(snapshot.auditIssues.isEmpty ? DashboardPalette.green : .orange) }
-                        Text(model.isRefreshing ? "正在刷新" : (snapshot.auditIssues.isEmpty ? "市场数据已校验" : "\(snapshot.auditIssues.count) 项差异"))
-                    }.font(.system(size: 7.5, weight: .medium)).lineLimit(1)
-                    Text("每日 16:15 ET · 收盘后").font(.system(size: 6.5)).foregroundStyle(DashboardPalette.muted).lineLimit(1)
-                    Divider().overlay(DashboardPalette.border)
-                    HStack(spacing: 3) {
-                        Image(systemName: snapshot.source.accountSource == nil ? "person.crop.circle" : "checkmark.shield.fill")
-                        Text(snapshot.source.accountSource == nil ? "账户 · 本地快照" : "账户 · IBKR \(snapshot.source.accountAsOf?.formatted(date: .omitted, time: .shortened) ?? "已同步")")
-                    }.font(.system(size: 6.2, weight: .medium)).foregroundStyle(snapshot.source.accountSource == nil ? DashboardPalette.muted : DashboardPalette.green).lineLimit(1)
-                    HStack(spacing: 3) { Image(systemName: "lock.fill"); Text("只读 · 不下单") }.font(.system(size: 6.2, weight: .medium)).foregroundStyle(DashboardPalette.muted).lineLimit(1)
-                }
-            }.frame(width: DashboardLayout.thirdCardWidth)
+    private func signal(_ snapshot: QQQMSnapshot, _ index: Int) -> MarketSignal {
+        guard snapshot.signals.indices.contains(index) else {
+            return MarketSignal(id: "missing-\(index)", title: "数据", value: "—", normalized: nil, source: "不可用", asOf: snapshot.lastUpdated, mode: snapshot.source.mode)
         }
-        .frame(height: 92).clipped()
-    }
-
-    @ViewBuilder private func confirmationButton(_ snapshot: QQQMSnapshot) -> some View {
-        if model.planConfirmed {
-            Label("本周计划已确认", systemImage: "checkmark.circle.fill").font(.system(size: 10, weight: .semibold)).frame(maxWidth: .infinity).frame(height: 28)
-                .foregroundStyle(DashboardPalette.buttonText).background(DashboardPalette.green, in: RoundedRectangle(cornerRadius: 8, style: .continuous)).layoutPriority(10).help("如需撤销，请使用右上角菜单中的“重新打开本周计划”。")
-        } else {
-            Button { model.confirmPlan() } label: { Label("确认本周计划 \(usd(snapshot.recommendation.recommendedAmount))", systemImage: "checkmark.circle").font(.system(size: 10, weight: .semibold)).frame(maxWidth: .infinity) }
-                .buttonStyle(.plain).foregroundStyle(DashboardPalette.buttonText).frame(height: 28)
-                .background(DashboardPalette.accent, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.white.opacity(0.16), lineWidth: 0.5))
-                .layoutPriority(10)
-                .help("仅记录计划确认；不会创建、提交或传输任何交易订单。")
-        }
+        return snapshot.signals[index]
     }
 
     private var unavailable: some View {
-        VStack(spacing: 12) { Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 25)).foregroundStyle(.orange); Text("快照不可用").font(.headline); Text(model.loadError ?? "请在设置中导入有效的 QQQM Snapshot。").font(.caption).foregroundStyle(DashboardPalette.muted).multilineTextAlignment(.center); Button("重新读取") { model.reload() } }.foregroundStyle(DashboardPalette.text).frame(maxWidth: .infinity, maxHeight: .infinity)
+        VStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 24)).foregroundStyle(QDesign.caution)
+            Text("数据暂不可用").font(.headline)
+            Text(model.loadError ?? "请在设置中导入有效的 QQQM 快照。")
+                .font(.caption).foregroundStyle(QDesign.secondary).multilineTextAlignment(.center)
+            Button("重新读取") { model.reload() }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func legend(_ text: String, _ color: Color, dot: Bool = false) -> some View { HStack(spacing: 3) { if dot { Circle().fill(color).frame(width: 5, height: 5) } else { Capsule().fill(color).frame(width: 8, height: 1.5) }; Text(text).font(.system(size: 6.5)).foregroundStyle(DashboardPalette.muted) } }
-    private func tradeLegend(_ code: String, _ text: String, _ color: Color) -> some View {
-        HStack(spacing: 3) {
-            Text(code).font(.system(size: 5, weight: .bold, design: .rounded)).foregroundStyle(.white)
-                .frame(width: 10, height: 10).background(color, in: Circle())
-            Text(text).foregroundStyle(DashboardPalette.muted)
+    private func recommendationTint(_ kind: RecommendationKind) -> Color {
+        switch kind { case .increase: QDesign.positive; case .decrease: QDesign.caution; case .normal: QDesign.accent }
+    }
+    private func executionLabel(_ date: Date) -> String {
+        let days = Calendar.current.dateComponents([.day], from: Calendar.current.startOfDay(for: Date()), to: Calendar.current.startOfDay(for: date)).day ?? 0
+        return switch days { case ...(-1): "已到期"; case 0: "今天执行"; case 1: "明天执行"; default: "\(days) 天后" }
+    }
+    private var standardTrendThresholds: String { "≤\(signedPercent(DCAThresholds.moreMomentum)) / ≥\(signedPercent(DCAThresholds.lessMomentum))" }
+    private var standardVIXThresholds: String { "≥\(whole(DCAThresholds.moreVIX)) / <\(whole(DCAThresholds.lessVIX))" }
+    private var standardSentimentThresholds: String { "<\(whole(DCAThresholds.moreSentiment)) / ≥\(whole(DCAThresholds.lessSentiment))" }
+    private var strongMoreConditions: String { "趋势 ≤\(signedPercent(DCAThresholds.strongMoreMomentum)) · CNN ≤\(whole(DCAThresholds.strongMoreSentiment)) · VIX ≥\(whole(DCAThresholds.strongMoreVIX))" }
+    private var moreConditions: String { "趋势 ≤\(signedPercent(DCAThresholds.moreMomentum)) · CNN <\(whole(DCAThresholds.moreSentiment)) · VIX ≥\(whole(DCAThresholds.moreVIX))" }
+    private var lessConditions: String { "趋势 ≥\(signedPercent(DCAThresholds.lessMomentum)) · CNN ≥\(whole(DCAThresholds.lessSentiment)) · VIX <\(whole(DCAThresholds.lessVIX))" }
+    private var strongLessConditions: String { "趋势 ≥\(signedPercent(DCAThresholds.strongLessMomentum)) · CNN ≥\(whole(DCAThresholds.strongLessSentiment)) · VIX <\(whole(DCAThresholds.strongLessVIX))" }
+    private func whole(_ value: Double) -> String { String(format: "%.0f", value) }
+    private func signedPercent(_ value: Double) -> String { "\(value >= 0 ? "+" : "−")\(whole(abs(value)))%" }
+    private func decisionSummary(_ snapshot: QQQMSnapshot) -> String {
+        if moreTriggerCount(snapshot) == 0 && lessTriggerCount(snapshot) < 3 {
+            let satisfied = satisfiedLessFactors(snapshot)
+            let suffix = satisfied.isEmpty ? "降档条件尚未满足" : "降档仅满足\(satisfied.joined(separator: "、"))"
+            return "升档 0/3；\(suffix)，本期维持 \(String(format: "%.2f", snapshot.recommendation.multiplier))× 基准。"
         }
+        return "趋势 \(signal(snapshot, 0).value) · VIX \(signal(snapshot, 1).value) · 情绪 \(signal(snapshot, 2).value)，本期采用 \(String(format: "%.2f", snapshot.recommendation.multiplier))× 基准。"
     }
-    private func seriesLegend(_ text: String, _ color: Color) -> some View {
-        HStack(spacing: 3) {
-            Capsule().fill(color).frame(width: 9, height: 1.5)
-            Text(text).foregroundStyle(DashboardPalette.muted)
+    private func shortDate(_ date: Date) -> String {
+        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "zh_CN"); formatter.timeZone = TimeZone(identifier: "America/New_York"); formatter.dateFormat = "M/d"
+        return formatter.string(from: date)
+    }
+    private func moreTriggerCount(_ snapshot: QQQMSnapshot) -> Int {
+        ruleAudit(snapshot).moreCount
+    }
+    private func lessTriggerCount(_ snapshot: QQQMSnapshot) -> Int {
+        ruleAudit(snapshot).lessCount
+    }
+    private func ruleAudit(_ snapshot: QQQMSnapshot) -> DCAConditionAudit {
+        DCAConditionAudit(momentum: periodReturn(snapshot), vix: vixValue(snapshot), sentiment: sentimentValue(snapshot))
+    }
+    private func moreTransitionDetail(_ snapshot: QQQMSnapshot) -> String {
+        let audit = ruleAudit(snapshot)
+        if audit.moreCount > 0 {
+            return triggeredFactors(audit.moreChecks).joined(separator: " · ") + " 已触发"
         }
+        return "趋势 ↓\(oneDecimal(audit.moreGaps[0]))pp · CNN ↓\(oneDecimal(audit.moreGaps[1])) · VIX ↑\(oneDecimal(audit.moreGaps[2]))"
     }
-    private func contributionHistory(_ snapshot: QQQMSnapshot) -> some View {
-        let recent = Array(snapshot.buyMarkers.filter { $0.quantity > 0 }.suffix(6))
-        let maximum = recent.map(\.amount).max() ?? 1
-        return VStack(alignment: .leading, spacing: 3) {
-            Text("定投历史").font(.system(size: 8, weight: .medium))
-            HStack(alignment: .bottom, spacing: 4) {
-                ForEach(recent) { marker in
-                    RoundedRectangle(cornerRadius: 1.5, style: .continuous)
-                        .fill(DashboardPalette.blue.gradient)
-                        .frame(height: max(3, 20 * CGFloat(marker.amount / maximum)))
-                        .help("\(marker.date.formatted(date: .abbreviated, time: .omitted)) · \(usd(marker.amount, decimals: 2))")
-                }
-            }
-            .frame(height: 20, alignment: .bottom)
-            ForEach(Array(recent.suffix(3).reversed())) { marker in
-                HStack(spacing: 2) {
-                    Text(marketDate(marker.date))
-                    Spacer()
-                    Text(usd(marker.amount))
-                    Image(systemName: "checkmark.circle.fill").foregroundStyle(DashboardPalette.green)
-                }
-                .font(.system(size: 6)).foregroundStyle(DashboardPalette.muted)
-            }
-        }
+    private func lessTransitionDetail(_ snapshot: QQQMSnapshot) -> String {
+        let audit = ruleAudit(snapshot)
+        if audit.lessCount == 3 { return "趋势 · CNN · VIX 已全部满足" }
+        var parts: [String] = []
+        if audit.lessChecks[0] { parts.append("趋势 ✓") } else { parts.append("趋势 ↑\(oneDecimal(audit.lessGaps[0]))pp") }
+        if audit.lessChecks[1] { parts.append("CNN ✓") } else { parts.append("CNN ↑\(oneDecimal(audit.lessGaps[1]))") }
+        if audit.lessChecks[2] { parts.append("VIX ✓") } else { parts.append("VIX ↓\(oneDecimal(audit.lessGaps[2]))") }
+        return parts.joined(separator: " · ")
     }
-    private func chartStat(_ title: String, _ value: String, _ tint: Color) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(title).font(.system(size: 6.2)).foregroundStyle(DashboardPalette.muted)
-            Text(value).font(.system(size: 8, weight: .semibold, design: .rounded)).foregroundStyle(tint).lineLimit(1).minimumScaleFactor(0.75)
-        }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 6)
+    private func triggeredFactors(_ checks: [Bool]) -> [String] {
+        let names = ["趋势", "CNN", "VIX"]
+        return checks.enumerated().compactMap { $0.element ? names[$0.offset] : nil }
     }
-    private func signalTile(_ item: MarketSignal, tint: Color) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 3) { Circle().fill(tint).frame(width: 4, height: 4); Text(item.title).font(.system(size: 6.5, weight: .medium)).foregroundStyle(DashboardPalette.muted).lineLimit(1) }
-            Text(item.value).font(.system(size: 10, weight: .semibold, design: .rounded)).lineLimit(1).minimumScaleFactor(0.72)
-            GeometryReader { proxy in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(DashboardPalette.track)
-                    Capsule().fill(tint.gradient).frame(width: proxy.size.width * CGFloat(min(max(item.normalized ?? 0, 0), 1)))
-                }
-            }.frame(height: 3)
-            Text(item.source).font(.system(size: 5.8)).foregroundStyle(DashboardPalette.muted).lineLimit(1).minimumScaleFactor(0.75)
-        }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 5)
+    private func satisfiedLessFactors(_ snapshot: QQQMSnapshot) -> [String] {
+        triggeredFactors(ruleAudit(snapshot).lessChecks)
     }
-    private func fearGreedTile(_ item: MarketSignal) -> some View {
-        let value = min(max(item.normalized ?? 0.5, 0), 1)
-        return VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 3) { Circle().fill(fearGreedTint(value)).frame(width: 4, height: 4); Text("CNN 恐惧贪婪").font(.system(size: 6.5, weight: .medium)).foregroundStyle(DashboardPalette.muted).lineLimit(1).minimumScaleFactor(0.72) }
-            Text(item.value).font(.system(size: 10, weight: .semibold, design: .rounded)).lineLimit(1).minimumScaleFactor(0.68)
-            GeometryReader { proxy in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(LinearGradient(colors: [DashboardPalette.coral, DashboardPalette.orange, DashboardPalette.rest, DashboardPalette.green, DashboardPalette.accent], startPoint: .leading, endPoint: .trailing))
-                    Circle().fill(DashboardPalette.elevated).frame(width: 4, height: 4)
-                        .overlay(Circle().stroke(DashboardPalette.text.opacity(0.72), lineWidth: 0.55))
-                        .offset(x: max(0, proxy.size.width * value - 2))
-                }
-            }.frame(height: 3)
-            Text(item.source).font(.system(size: 5.8)).foregroundStyle(DashboardPalette.muted).lineLimit(1).minimumScaleFactor(0.72)
-        }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 5)
+    private func oneDecimal(_ value: Double) -> String {
+        let rounded = value.rounded()
+        return abs(value - rounded) < 0.05 ? String(format: "%.0f", value) : String(format: "%.1f", value)
     }
-    private func fearGreedTint(_ value: Double) -> Color {
-        switch value { case ..<0.25: DashboardPalette.coral; case ..<0.45: DashboardPalette.orange; case ..<0.56: DashboardPalette.rest; case ..<0.75: DashboardPalette.green; default: DashboardPalette.accent }
+    private func periodReturn(_ snapshot: QQQMSnapshot) -> Double {
+        guard let first = snapshot.priceHistory.first?.close, let last = snapshot.priceHistory.last?.close, first > 0 else { return 0 }
+        return (last / first - 1) * 100
     }
-    private func signal(_ snapshot: QQQMSnapshot, at index: Int) -> MarketSignal {
-        if snapshot.signals.indices.contains(index) { return snapshot.signals[index] }
-        return MarketSignal(id: "missing-\(index)", title: "数据", value: "—", normalized: 0, source: "暂不可用", asOf: snapshot.lastUpdated, mode: snapshot.source.mode)
+    private func number(in text: String) -> Double? {
+        let filtered = text.filter { $0.isNumber || $0 == "." || $0 == "-" }
+        return Double(filtered)
     }
-    private func buyTimeline(_ snapshot: QQQMSnapshot) -> some View {
-        HStack(spacing: 2) {
-            ForEach(Array(snapshot.buyMarkers.suffix(4))) { marker in
-                VStack(spacing: 1) { Circle().fill(DashboardPalette.green).frame(width: 5, height: 5); Text(marker.date, format: .dateTime.month(.defaultDigits).day()).lineLimit(1); Text(usd(marker.amount)).lineLimit(1) }
-                    .font(.system(size: 5.5)).foregroundStyle(DashboardPalette.muted).frame(maxWidth: .infinity)
-            }
-            VStack(spacing: 1) { Circle().fill(DashboardPalette.accent).frame(width: 5, height: 5); Text("计划"); Text(usd(snapshot.recommendation.recommendedAmount)) }
-                .font(.system(size: 5.5)).foregroundStyle(DashboardPalette.muted).frame(maxWidth: .infinity)
-        }
-        .frame(height: 24)
+    private func trendPosition(_ snapshot: QQQMSnapshot) -> Double { min(max((periodReturn(snapshot) + 10) / 25, 0), 1) }
+    private func trendStatus(_ snapshot: QQQMSnapshot) -> String {
+        switch periodReturn(snapshot) { case ...(-10): "明显回撤"; case ..<(-5): "回撤区间"; case 15...: "强势区间"; case 8...: "偏强区间"; default: "中性区间" }
     }
-    private func chartSideStats(_ snapshot: QQQMSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("日内范围").font(.system(size: 6)).foregroundStyle(DashboardPalette.muted)
-                HStack { Text(snapshot.quote.dayLow.map { usd($0, decimals: 2) } ?? "—"); Spacer(); Text(snapshot.quote.dayHigh.map { usd($0, decimals: 2) } ?? "—") }.font(.system(size: 6, weight: .medium))
-                GeometryReader { proxy in ZStack { Capsule().fill(LinearGradient(colors: [DashboardPalette.green, .yellow, .red], startPoint: .leading, endPoint: .trailing)); if let low = snapshot.quote.dayLow, let high = snapshot.quote.dayHigh, high > low { Circle().fill(.white).frame(width: 4, height: 4).offset(x: proxy.size.width * CGFloat((snapshot.quote.lastPrice - low) / (high - low)) - 2) } } }.frame(height: 3)
-            }
-            Divider().overlay(DashboardPalette.border)
-            VStack(alignment: .leading, spacing: 2) { Text("YTD 涨跌幅").font(.system(size: 6)).foregroundStyle(DashboardPalette.muted); Text(percent(snapshot.quote.ytdChangePct)).font(.system(size: 10, weight: .semibold)).foregroundStyle(DashboardPalette.green); Sparkline(values: Array(snapshot.priceHistory.map(\.close).suffix(8)), color: DashboardPalette.green).frame(height: 12) }
-            Divider().overlay(DashboardPalette.border)
-            VStack(alignment: .leading, spacing: 2) { Text("30日波动率(年化)").font(.system(size: 6)).foregroundStyle(DashboardPalette.muted); Text(snapshot.quote.annualizedVol30D.map { String(format: "%.1f%%", $0) } ?? "—").font(.system(size: 10, weight: .semibold)).foregroundStyle(DashboardPalette.steel); Sparkline(values: Array(snapshot.priceHistory.map(\.close).suffix(8).reversed()), color: DashboardPalette.steel).frame(height: 12) }
-        }
-        .frame(maxHeight: .infinity, alignment: .top)
+    private func trendTint(_ snapshot: QQQMSnapshot) -> Color {
+        let value = periodReturn(snapshot)
+        return value <= -5 ? QDesign.positive : (value >= 8 ? QDesign.caution : QDesign.accent)
     }
-    private func statusMetric(title: String, value: String, icon: String, tint: Color) -> some View { VStack(alignment: .leading, spacing: 2) { Text(title).font(.system(size: 7, weight: .medium)).foregroundStyle(DashboardPalette.muted); Image(systemName: icon).font(.system(size: 10)).foregroundStyle(tint); Text(value).font(.system(size: 8, weight: .semibold)).lineLimit(1); Text(value == "未接入" ? "等待数据源" : "已载入快照").font(.system(size: 6)).foregroundStyle(DashboardPalette.muted).lineLimit(1) }.frame(maxWidth: .infinity, alignment: .leading) }
-    private func pair(_ title: String, _ value: String, _ tint: Color = DashboardPalette.text) -> some View { HStack { Text(title).foregroundStyle(DashboardPalette.muted); Spacer(minLength: 1); Text(value).foregroundStyle(tint).fontWeight(.medium) }.font(.system(size: 7)).lineLimit(1) }
-    private func recommendationTint(_ kind: RecommendationKind) -> Color { switch kind { case .increase: DashboardPalette.green; case .decrease: DashboardPalette.orange; case .normal: DashboardPalette.accent } }
-    private func compactDays(_ date: Date) -> String { let days = Calendar.current.dateComponents([.day], from: Calendar.current.startOfDay(for: Date()), to: Calendar.current.startOfDay(for: date)).day ?? 0; switch days { case ...(-1): return "已过期"; case 0: return "今天"; case 1: return "明天"; default: return "\(days) 天后" } }
-    private func marketDate(_ date: Date) -> String { let formatter = DateFormatter(); formatter.locale = Locale(identifier: "zh_CN"); formatter.timeZone = TimeZone(identifier: "America/New_York"); formatter.dateFormat = "M/d"; return formatter.string(from: date) }
-    private func signalValue(_ snapshot: QQQMSnapshot, at index: Int) -> String { snapshot.signals.indices.contains(index) ? snapshot.signals[index].value : "未接入" }
-    private func chartDates(_ snapshot: QQQMSnapshot) -> [Date] { let history = snapshot.priceHistory; guard !history.isEmpty else { return [] }; let indices = [0, history.count / 3, history.count * 2 / 3]; return indices.map { history[min($0, history.count - 1)].date } + [snapshot.recommendation.nextExecution] }
-    private func allocationRow(_ title: String, value: Double, weight: Double, tint: Color) -> some View {
-        HStack(spacing: 3) {
-            RoundedRectangle(cornerRadius: 1, style: .continuous).fill(tint).frame(width: 5, height: 5)
-            Text(title).foregroundStyle(DashboardPalette.muted)
-            Spacer(minLength: 1)
-            Text(usd(value)).foregroundStyle(DashboardPalette.text)
-            Text(ratioPercent(weight)).fontWeight(.medium).frame(width: 31, alignment: .trailing)
-        }
-        .font(.system(size: 6.1))
-        .lineLimit(1)
+    private func vixValue(_ snapshot: QQQMSnapshot) -> Double { number(in: signal(snapshot, 1).value) ?? 22 }
+    private func vixPosition(_ snapshot: QQQMSnapshot) -> Double { min(max((vixValue(snapshot) - 18) / 14, 0), 1) }
+    private func vixStatus(_ snapshot: QQQMSnapshot) -> String {
+        switch vixValue(snapshot) { case 32...: "高波动"; case 25...: "偏高波动"; case ..<18: "低波动"; case ..<22: "温和波动"; default: "中性区间" }
     }
-    private func holdingMetric(_ title: String, _ value: String) -> some View { VStack(alignment: .leading, spacing: 1) { Text(title).font(.system(size: 6)).foregroundStyle(DashboardPalette.muted); Text(value).font(.system(size: 8, weight: .medium, design: .rounded)).monospacedDigit() }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 4) }
-    private func periodLow(_ snapshot: QQQMSnapshot) -> String { snapshot.priceHistory.map(\.close).min().map { usd($0, decimals: 2) } ?? "—" }
-    private func periodHigh(_ snapshot: QQQMSnapshot) -> String { snapshot.priceHistory.map(\.close).max().map { usd($0, decimals: 2) } ?? "—" }
-    private func periodReturn(_ snapshot: QQQMSnapshot) -> Double { guard let first = snapshot.priceHistory.first?.close, let last = snapshot.priceHistory.last?.close, first > 0 else { return 0 }; return (last / first - 1) * 100 }
-    private func costDeviation(_ snapshot: QQQMSnapshot) -> Double { let cost = snapshot.portfolio.averageCost; return cost > 0 ? (snapshot.quote.lastPrice / cost - 1) * 100 : 0 }
-    private func percent(_ value: Double?) -> String { guard let value else { return "—" }; return String(format: "%+.2f%%", value) }
-    private func ratioPercent(_ value: Double) -> String { String(format: "%.2f%%", value * 100) }
-    private func unrealizedPercent(_ snapshot: QQQMSnapshot) -> Double? { let basis = snapshot.portfolio.averageCost * snapshot.portfolio.shares; return basis > 0 ? snapshot.verifiedUnrealizedPnL / basis * 100 : nil }
-    private func usd(_ amount: Double, decimals: Int = 0) -> String { let formatter = NumberFormatter(); formatter.numberStyle = .currency; formatter.currencyCode = "USD"; formatter.currencySymbol = "$"; formatter.locale = Locale(identifier: "en_US"); formatter.minimumFractionDigits = decimals; formatter.maximumFractionDigits = decimals; return formatter.string(from: NSNumber(value: amount)) ?? String(format: "$%.\(decimals)f", amount) }
-    private func signedUSD(_ amount: Double) -> String { "\(amount >= 0 ? "+" : "−")\(usd(abs(amount), decimals: 2))" }
+    private func vixTint(_ snapshot: QQQMSnapshot) -> Color {
+        let value = vixValue(snapshot)
+        return value >= 25 ? QDesign.positive : (value < 22 ? QDesign.caution : QDesign.accent)
+    }
+    private func sentimentValue(_ snapshot: QQQMSnapshot) -> Double { (signal(snapshot, 2).normalized ?? 0.5) * 100 }
+    private func sentimentPosition(_ snapshot: QQQMSnapshot) -> Double { min(max((sentimentValue(snapshot) - 25) / 50, 0), 1) }
+    private func sentimentStatus(_ snapshot: QQQMSnapshot) -> String {
+        switch sentimentValue(snapshot) { case ...25: "极度恐惧"; case ..<40: "偏恐惧"; case 75...: "偏贪婪"; case 65...: "情绪偏热"; default: "中性区间" }
+    }
+    private func sentimentTint(_ snapshot: QQQMSnapshot) -> Color {
+        let value = sentimentValue(snapshot)
+        return value < 40 ? QDesign.positive : (value >= 65 ? QDesign.caution : QDesign.accent)
+    }
+    private func percent(_ value: Double?) -> String { value.map { String(format: "%+.2f%%", $0) } ?? "—" }
+    private func unrealizedPercent(_ snapshot: QQQMSnapshot) -> Double? {
+        let basis = snapshot.portfolio.averageCost * snapshot.portfolio.shares
+        return basis > 0 ? snapshot.verifiedUnrealizedPnL / basis * 100 : nil
+    }
+    private func costDeviation(_ snapshot: QQQMSnapshot) -> Double? {
+        guard snapshot.portfolio.averageCost > 0 else { return nil }
+        return (snapshot.quote.lastPrice / snapshot.portfolio.averageCost - 1) * 100
+    }
+    private func costRelationship(_ snapshot: QQQMSnapshot) -> String {
+        let delta = snapshot.quote.lastPrice - snapshot.portfolio.averageCost
+        if abs(delta) < 0.005 { return "接近成本" }
+        return "\(delta > 0 ? "高于" : "低于") \(usd(abs(delta), decimals: 2))"
+    }
+    private func costRelationshipTint(_ snapshot: QQQMSnapshot) -> Color {
+        snapshot.quote.lastPrice >= snapshot.portfolio.averageCost ? QDesign.positive : QDesign.negative
+    }
+    private func usd(_ amount: Double, decimals: Int = 0) -> String {
+        QFormat.usd(amount, decimals: decimals)
+    }
+    private func signedUSD(_ amount: Double) -> String { QFormat.signedUSD(amount) }
 }
 
 @MainActor
@@ -1762,66 +2127,227 @@ final class LoginItemController: ObservableObject {
     }
 }
 
+private struct SettingsScrollContainer<Content: View>: View {
+    let enabled: Bool
+    @ViewBuilder let content: Content
+
+    init(enabled: Bool, @ViewBuilder content: () -> Content) {
+        self.enabled = enabled
+        self.content = content()
+    }
+
+    @ViewBuilder var body: some View {
+        if enabled {
+            ScrollView { content }.scrollIndicators(.hidden)
+        } else {
+            content
+        }
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
     @StateObject private var login = LoginItemController()
     @State private var importing = false
+    private let staticPreview: Bool
+
+    init(staticPreview: Bool = false) {
+        self.staticPreview = staticPreview
+    }
+
     var body: some View {
-        Form {
-            Section("常驻") { Toggle("登录后自动启动", isOn: Binding(get: { login.enabled }, set: { login.setEnabled($0) })); if let message = login.message { Text(message).font(.caption).foregroundStyle(.red) } }
-            Section("数据") {
-                LabeledContent("当前数据", value: model.snapshot?.source.mode.label ?? "不可用")
-                LabeledContent("更新时间", value: model.snapshot?.lastUpdated.formatted(date: .abbreviated, time: .shortened) ?? "—")
-                LabeledContent("自动刷新", value: "美股交易日 16:15 ET")
-                LabeledContent("账户来源", value: model.snapshot?.source.accountSource ?? "本地快照")
-                if let accountAsOf = model.snapshot?.source.accountAsOf { LabeledContent("账户同步", value: accountAsOf.formatted(date: .abbreviated, time: .shortened)) }
-                LabeledContent("内部校验", value: model.snapshot.map { $0.auditIssues.isEmpty ? "通过" : "\($0.auditIssues.count) 项差异" } ?? "不可用")
-                if let notes = model.snapshot?.source.notes { Text(notes).font(.caption).foregroundStyle(.secondary) }
-                if let error = model.marketError { Text(error).font(.caption).foregroundStyle(.orange) }
-                if let issues = model.snapshot?.auditIssues, !issues.isEmpty { ForEach(issues, id: \.self) { Text($0).font(.caption).foregroundStyle(.orange) } }
-                Button(model.isRefreshing ? "正在刷新…" : "立即刷新市场数据") { Task { await model.refreshMarketData(force: true) } }.disabled(model.isRefreshing)
-                Button("导入账户快照…") { importing = true }; Button("打开数据文件夹") { model.openDataFolder() }
-                Text("导入文件必须是 schemaVersion 2 的 QQQM 快照。当前 App 仅读取与展示数据，不含任何下单功能。").font(.caption).foregroundStyle(.secondary)
+        VStack(spacing: 0) {
+            settingsHeader
+            Divider().overlay(QDesign.separator)
+            SettingsScrollContainer(enabled: !staticPreview) {
+                VStack(spacing: 12) {
+                    settingsSection("运行方式", icon: "menubar.rectangle") {
+                    Toggle("登录后自动启动", isOn: Binding(get: { login.enabled }, set: { login.setEnabled($0) }))
+                    if let message = login.message { statusCallout(message, tint: QDesign.negative, icon: "xmark.circle.fill") }
+                    }
+
+                    settingsSection("数据与同步", icon: "externaldrive.badge.icloud") {
+                        settingsValueRow("状态", dataState.title, valueTint: dataState.tint)
+                        settingsValueRow("当前数据", model.snapshot?.source.mode.label ?? "不可用")
+                        settingsValueRow("更新时间", model.snapshot?.lastUpdated.formatted(date: .abbreviated, time: .shortened) ?? "—")
+                        settingsValueRow("自动刷新", "美股收盘后 15 分钟 · 每日一次")
+                        settingsValueRow("账户来源", model.snapshot?.source.accountSource ?? "本地快照")
+                        if let accountAsOf = model.snapshot?.source.accountAsOf {
+                            settingsValueRow("账户同步", accountAsOf.formatted(date: .abbreviated, time: .shortened))
+                        }
+                        settingsValueRow("内部校验", model.snapshot.map { $0.auditIssues.isEmpty ? "通过" : "\($0.auditIssues.count) 项差异" } ?? "不可用")
+                        if let notes = model.snapshot?.source.notes { Text(notes).font(.caption).foregroundStyle(QDesign.secondary) }
+                        if let error = model.marketError { statusCallout(error, tint: QDesign.caution, icon: "arrow.clockwise.circle.fill") }
+                        if let issues = model.snapshot?.auditIssues, !issues.isEmpty {
+                            ForEach(issues, id: \.self) { statusCallout($0, tint: QDesign.caution, icon: "exclamationmark.triangle.fill") }
+                        }
+                        HStack {
+                            Button { Task { await model.refreshMarketData(force: true) } } label: {
+                                Label(model.isRefreshing ? "正在刷新…" : "立即刷新", systemImage: "arrow.clockwise")
+                            }
+                            .disabled(model.isRefreshing)
+                            Button { importing = true } label: { Label("导入快照…", systemImage: "square.and.arrow.down") }
+                            Button { model.openDataFolder() } label: { Label("数据文件夹", systemImage: "folder") }
+                        }
+                        Text("导入文件必须是 schemaVersion 2 的 QQQM 快照。App 仅读取与展示数据，不含任何下单功能。")
+                            .font(.caption).foregroundStyle(QDesign.secondary)
+                    }
+
+                    settingsSection("US$400 分档规则", icon: "point.3.connected.trianglepath.dotted") {
+                    ruleRow("$600", "明显多投", "趋势 ≤−10%  或  CNN ≤25  或  VIX ≥32", tint: QDesign.positive)
+                    ruleRow("$500", "适度多投", "趋势 ≤−5%  或  CNN <40  或  VIX ≥25", tint: QDesign.positive)
+                    ruleRow("$400", "维持基准", "其余常态区间", tint: QDesign.accent)
+                    ruleRow("$300", "适度少投", "趋势 ≥+8%  且  CNN ≥65  且  VIX <22", tint: QDesign.caution)
+                    ruleRow("$200", "明显少投", "趋势 ≥+15%  且  CNN ≥75  且  VIX <18", tint: QDesign.caution)
+                    Text("菜单栏圆点只在计划日前 3 天出现：绿色为多投、青色为基准、琥珀色为少投、红色为逾期或数据异常；没有呼吸动画。")
+                        .font(.caption).foregroundStyle(QDesign.secondary)
+                        Text("US$200–600 是围绕 US$400 基准的启发式分档，用于保持执行纪律，不是收益预测。")
+                            .font(.caption).foregroundStyle(QDesign.secondary)
+                    }
+
+                    settingsSection("安全边界", icon: "checkmark.shield") {
+                    Label("只读 · 不下单", systemImage: "lock.shield.fill")
+                        .foregroundStyle(QDesign.positive)
+                    Text("规则只生成计划建议；确认操作只在本地保存记录，不会创建、提交或传输 IBKR 订单。")
+                            .font(.caption).foregroundStyle(QDesign.secondary)
+                    }
+                }
+                .padding(16)
             }
-            Section("US$400 定投规则") {
-                Text("明显多投 US$600：30 日跌幅 ≥10%，或情绪 ≤25，或 VIX ≥32\n适度多投 US$500：30 日跌幅 ≥5%，或情绪 <40，或 VIX ≥25\n按基准投入 US$400：其余常态区间\n适度少投 US$300：30 日涨幅 ≥8%、情绪 ≥65 且 VIX <22\n明显少投 US$200：30 日涨幅 ≥15%、情绪 ≥75 且 VIX <18")
-                    .font(.caption).foregroundStyle(.secondary)
-                Text("菜单栏圆点会在计划日前 3 天出现：绿色表示多投、青色表示基准、琥珀色表示少投、红色表示逾期或数据异常。无呼吸动画。").font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(width: 500, height: staticPreview ? 820 : 620)
+        .background(QDesign.background)
+        .foregroundStyle(QDesign.primary)
+        .tint(QDesign.accent)
+        .fileImporter(isPresented: $importing, allowedContentTypes: [.json]) { result in
+            if case .success(let url) = result { model.importSnapshot(from: url) }
+        }
+    }
+
+    private var settingsHeader: some View {
+        HStack(spacing: 12) {
+            Image(nsImage: StatusGlyphImage.make(state: model.iconState))
+                .renderingMode(.template)
+                .resizable().scaledToFit()
+                .foregroundStyle(QDesign.primary)
+                .frame(width: 24, height: 24)
+                .frame(width: 42, height: 42)
+                .background(QDesign.elevated, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(QDesign.separator, lineWidth: 0.7))
+            VStack(alignment: .leading, spacing: 2) {
+                Text("QQQMBar").font(.system(size: 17, weight: .semibold))
+                Text("只读定投计划助手").font(.system(size: 11)).foregroundStyle(QDesign.secondary)
             }
-            Section("安全") { Text("规则只生成计划建议；确认操作仅保存本地记录，不会创建、提交或传输 IBKR 订单。").font(.caption).foregroundStyle(.secondary) }
-        }.formStyle(.grouped).padding().frame(width: 470, height: 560)
-            .fileImporter(isPresented: $importing, allowedContentTypes: [.json]) { result in if case .success(let url) = result { model.importSnapshot(from: url) } }
+            Spacer()
+            Label(dataState.title, systemImage: dataState.icon)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(dataState.tint)
+        }
+        .padding(.horizontal, 20).padding(.vertical, 15)
+    }
+
+    private var dataState: (title: String, icon: String, tint: Color) {
+        if model.isRefreshing { return ("正在更新", "arrow.triangle.2.circlepath", QDesign.accent) }
+        if model.marketError != nil { return ("沿用有效快照", "arrow.clockwise.circle.fill", QDesign.caution) }
+        if let issues = model.snapshot?.auditIssues, !issues.isEmpty { return ("需要检查", "exclamationmark.triangle.fill", QDesign.caution) }
+        if model.snapshot == nil { return ("数据不可用", "xmark.circle.fill", QDesign.negative) }
+        return ("数据已校验", "checkmark.seal.fill", QDesign.positive)
+    }
+
+    private func sectionLabel(_ title: String, icon: String) -> some View {
+        Label(title, systemImage: icon)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(QDesign.primary)
+    }
+
+    private func settingsSection<Content: View>(
+        _ title: String,
+        icon: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionLabel(title, icon: icon)
+            Rectangle().fill(QDesign.separator.opacity(0.75)).frame(height: 0.6)
+            content()
+        }
+        .padding(13)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(QDesign.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(QDesign.separator.opacity(0.82), lineWidth: 0.65))
+    }
+
+    private func settingsValueRow(_ title: String, _ value: String, valueTint: Color = QDesign.primary) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(title).foregroundStyle(QDesign.secondary)
+            Spacer()
+            Text(value).foregroundStyle(valueTint).multilineTextAlignment(.trailing)
+        }
+        .font(.system(size: 11))
+        .accessibilityElement(children: .combine)
+    }
+
+    private func statusCallout(_ text: String, tint: Color, icon: String) -> some View {
+        Label(text, systemImage: icon)
+            .font(.caption)
+            .foregroundStyle(tint)
+    }
+
+    private func ruleRow(_ amount: String, _ title: String, _ condition: String, tint: Color) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(amount)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(tint)
+                .frame(width: 38, alignment: .leading)
+            Text(title).font(.system(size: 11, weight: .medium)).frame(width: 58, alignment: .leading)
+            Text(condition).font(.system(size: 10, design: .rounded)).foregroundStyle(QDesign.secondary)
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 
 #if QQQMBAR_RENDER_TEST
 private struct IconQAView: View {
+    private let states: [(String, Color?)] = [
+        ("常态", nil),
+        ("基准", QDesign.accent),
+        ("多投", QDesign.positive),
+        ("少投", QDesign.caution),
+        ("异常", QDesign.negative)
+    ]
+
     var body: some View {
-        HStack(spacing: 24) {
-            VStack(spacing: 8) {
-                RingBadge(confirmed: false, isRefreshing: false)
-                RingBadge(confirmed: true, isRefreshing: false)
+        VStack(alignment: .leading, spacing: 12) {
+            Text("菜单栏状态图标").font(.system(size: 11, weight: .semibold))
+            HStack(spacing: 12) {
+                ForEach(Array(states.enumerated()), id: \.offset) { _, state in
+                    iconCell(background: Color.white.opacity(0.90), foreground: .black, badge: state.1, label: state.0)
+                }
             }
-            VStack(spacing: 8) {
-                iconCell(Color(red: 0.16, green: 0.55, blue: 0.72), badge: DashboardPalette.accent)
-                iconCell(Color.black.opacity(0.88), badge: DashboardPalette.green)
+            HStack(spacing: 12) {
+                ForEach(Array(states.enumerated()), id: \.offset) { _, state in
+                    iconCell(background: Color.black.opacity(0.88), foreground: .white, badge: state.1, label: state.0)
+                }
             }
         }
-        .padding(18)
-        .background(Color(red: 0.025, green: 0.065, blue: 0.115))
+        .padding(16)
+        .foregroundStyle(QDesign.primary)
+        .background(QDesign.background)
     }
 
-    private func iconCell(_ background: Color, badge: Color) -> some View {
-        ZStack {
-            Image(nsImage: StatusGlyphImage.make(state: .pending))
-                .renderingMode(.template)
-                .resizable()
-                .foregroundStyle(.white)
-                .frame(width: 18, height: 18)
-            Circle().fill(badge).frame(width: 4, height: 4).offset(x: 8, y: -7)
-        }
-            .frame(width: 30, height: 30)
+    private func iconCell(background: Color, foreground: Color, badge: Color?, label: String) -> some View {
+        VStack(spacing: 4) {
+            ZStack {
+                Image(nsImage: StatusGlyphImage.make(state: .pending))
+                    .renderingMode(.template)
+                    .resizable()
+                    .foregroundStyle(foreground)
+                    .frame(width: 18, height: 18)
+                if let badge { Circle().fill(badge).frame(width: 4, height: 4).offset(x: 8, y: -7) }
+            }
+            .frame(width: 30, height: 26)
             .background(background, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            Text(label).font(.system(size: 7.5)).foregroundStyle(QDesign.secondary)
+        }
     }
 }
 
@@ -1838,12 +2364,36 @@ struct QQQMBarRenderTest {
         } else {
             snapshot = arguments.contains("--live") ? try await LiveMarketDataService().refreshedSnapshot(from: .fixture) : .fixture
         }
-        let model = AppModel(previewSnapshot: snapshot)
+        let unavailable = arguments.contains("--unavailable")
+        let confirmed = arguments.contains("--confirmed")
+        let model = AppModel(
+            previewSnapshot: unavailable ? nil : snapshot,
+            previewConfirmation: confirmed ? PlanConfirmation(recommendationID: snapshot.recommendation.id, confirmedAt: Date()) : nil,
+            previewMarketError: arguments.contains("--market-error") ? "市场数据刷新失败：网络暂不可用" : nil,
+            previewLoadError: unavailable ? "快照结构校验失败，上一份文件未被覆盖。" : nil,
+            previewIsRefreshing: arguments.contains("--refreshing"),
+            forcePreviewMode: true
+        )
         let iconsOnly = arguments.contains("--icons")
-        let content = iconsOnly ? AnyView(IconQAView()) : AnyView(MenuPopoverView().environmentObject(model))
+        let settingsOnly = arguments.contains("--settings")
+        let content: AnyView
+        if iconsOnly {
+            content = AnyView(IconQAView())
+        } else if settingsOnly {
+            content = AnyView(SettingsView(staticPreview: true).environmentObject(model))
+        } else {
+            content = AnyView(MenuPopoverView(initialRuleDisclosure: arguments.contains("--expanded")).environmentObject(model))
+        }
         let scheme: ColorScheme = arguments.contains("--light") ? .light : .dark
         let renderer = ImageRenderer(content: content.environment(\.colorScheme, scheme))
-        renderer.proposedSize = iconsOnly ? ProposedViewSize(width: 154, height: 124) : ProposedViewSize(width: DashboardLayout.width, height: DashboardLayout.height)
+        let previewHeight: CGFloat = arguments.contains("--expanded") ? 950 : DashboardLayout.height
+        if iconsOnly {
+            renderer.proposedSize = ProposedViewSize(width: 330, height: 150)
+        } else if settingsOnly {
+            renderer.proposedSize = ProposedViewSize(width: 500, height: 820)
+        } else {
+            renderer.proposedSize = ProposedViewSize(width: DashboardLayout.width, height: previewHeight)
+        }
         renderer.scale = 2
         guard let image = renderer.nsImage,
               let tiff = image.tiffRepresentation,
@@ -1873,6 +2423,18 @@ struct QQQMBarSelfTest {
         precondition(dcaAllocationBand(momentum: 1, vix: 20, sentimentScore: 50) == .normal)
         precondition(dcaAllocationBand(momentum: 10, vix: 17, sentimentScore: 70) == .decrease)
         precondition(dcaAllocationBand(momentum: 16, vix: 17, sentimentScore: 80) == .strongDecrease)
+        let neutralAudit = DCAConditionAudit(momentum: 2.9, vix: 14.5, sentiment: 54)
+        precondition(neutralAudit.moreCount == 0 && neutralAudit.lessCount == 1 && neutralAudit.band == .normal)
+        precondition(abs(neutralAudit.moreGaps[0] - 7.9) < 0.001)
+        precondition(abs(neutralAudit.moreGaps[1] - 14) < 0.001)
+        precondition(abs(neutralAudit.moreGaps[2] - 10.5) < 0.001)
+        precondition(abs(neutralAudit.lessGaps[0] - 5.1) < 0.001)
+        precondition(abs(neutralAudit.lessGaps[1] - 11) < 0.001)
+        precondition(neutralAudit.lessGaps[2] == 0)
+        let moreAudit = DCAConditionAudit(momentum: -6, vix: 20, sentiment: 50)
+        precondition(moreAudit.moreCount == 1 && moreAudit.band == .increase)
+        let lessAudit = DCAConditionAudit(momentum: 10, vix: 17, sentiment: 70)
+        precondition(lessAudit.lessCount == 3 && lessAudit.band == .decrease)
         let cnnJSON = #"{"fear_and_greed":{"score":54.4285714285714,"rating":"neutral","timestamp":"2026-08-28T23:59:58+00:00"}}"#.data(using: .utf8)!
         let cnn = try! LiveMarketDataService.parseCNNFearGreed(cnnJSON)
         precondition(abs(cnn.score - 54.4285714285714) < 0.0001 && cnn.localizedRating == "中性")
