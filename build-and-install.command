@@ -19,8 +19,8 @@ cp "$PROJECT_DIR/QQQMBar/Info.plist" "$CONTENTS/Info.plist"
 plutil -replace CFBundleExecutable -string QQQMBar "$CONTENTS/Info.plist"
 plutil -replace CFBundleIdentifier -string com.lyh.qqqmbar "$CONTENTS/Info.plist"
 plutil -replace CFBundleName -string QQQMBar "$CONTENTS/Info.plist"
-plutil -replace CFBundleShortVersionString -string 0.18.2 "$CONTENTS/Info.plist"
-plutil -replace CFBundleVersion -string 39 "$CONTENTS/Info.plist"
+plutil -replace CFBundleShortVersionString -string 0.20.1 "$CONTENTS/Info.plist"
+plutil -replace CFBundleVersion -string 46 "$CONTENTS/Info.plist"
 
 xcrun swiftc -parse-as-library -O \
   "$PROJECT_DIR/QQQMBar/QQQMBarApp.swift" \

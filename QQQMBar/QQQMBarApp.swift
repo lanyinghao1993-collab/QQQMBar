@@ -1098,6 +1098,15 @@ private enum DashboardLayout {
 
 private enum TradeDirection: String { case buy, sell }
 
+private struct PrimaryActionButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.86 : 1)
+            .scaleEffect(configuration.isPressed ? 0.985 : 1)
+            .animation(.easeOut(duration: 0.10), value: configuration.isPressed)
+    }
+}
+
 private func exponentialMovingAverage(_ points: [PricePoint], period: Int) -> [PricePoint] {
     guard period > 0, let first = points.first else { return [] }
     let smoothing = 2.0 / (Double(period) + 1.0)
@@ -1138,8 +1147,6 @@ private enum QDesign {
     static let positive = adaptive(light: 0x2A8D57, dark: 0x6BC887)
     static let caution = adaptive(light: 0xA36A16, dark: 0xE1A43A)
     static let negative = adaptive(light: 0xB94E48, dark: 0xE9776D)
-    static let buttonText = adaptive(light: 0xFFFFFF, dark: 0x031012)
-
     static let outerRadius: CGFloat = 16
     static let innerRadius: CGFloat = 9
     static let sectionPadding: CGFloat = 12
@@ -1177,10 +1184,6 @@ private struct QDecisionCanvas<Content: View>: View {
             .background {
                 RoundedRectangle(cornerRadius: QDesign.outerRadius, style: .continuous)
                     .fill(QDesign.surface.opacity(colorScheme == .dark ? 0.93 : 0.98))
-            }
-            .overlay {
-                RoundedRectangle(cornerRadius: QDesign.outerRadius, style: .continuous)
-                    .stroke(QDesign.separator.opacity(colorScheme == .dark ? 0.50 : 0.58), lineWidth: 0.4)
             }
     }
 }
@@ -1260,7 +1263,93 @@ private struct FreshTradeEvent: Identifiable {
     let date: Date
     let price: Double
     let count: Int
+    let quantity: Double
+    let amount: Double
     let direction: TradeDirection
+}
+
+private func marketTradingDayComponents(for date: Date) -> DateComponents {
+    var marketCalendar = Calendar(identifier: .gregorian)
+    marketCalendar.timeZone = MarketRefreshSchedule.marketTimeZone
+    return marketCalendar.dateComponents([.year, .month, .day], from: date)
+}
+
+private func marketTradingDayDate(for date: Date) -> Date {
+    var chartCalendar = Calendar(identifier: .gregorian)
+    chartCalendar.timeZone = TimeZone(secondsFromGMT: 0)!
+    return chartCalendar.date(from: marketTradingDayComponents(for: date)) ?? date
+}
+
+private func aggregateTradeValues(_ markers: [BuyMarker]) -> (quantity: Double, price: Double, amount: Double)? {
+    guard let first = markers.first else { return nil }
+    let quantity = markers.reduce(0) { $0 + abs($1.quantity) }
+    let amount = markers.reduce(0) { $0 + abs($1.amount) }
+    let weightedPrice = quantity > 0
+        ? markers.reduce(0) { $0 + abs($1.quantity) * $1.price } / quantity
+        : first.price
+    return (quantity, weightedPrice, amount)
+}
+
+private func groupedTradeEvents(_ snapshot: QQQMSnapshot, within domain: ClosedRange<Date>) -> [FreshTradeEvent] {
+    let markers = snapshot.buyMarkers.filter { domain.contains($0.date) }
+    let grouped = Dictionary(grouping: markers) { marker in
+        let day = marketTradingDayComponents(for: marker.date)
+        return "\(day.year ?? 0)-\(day.month ?? 0)-\(day.day ?? 0)-\(marker.quantity < 0 ? "sell" : "buy")"
+    }
+    return grouped.compactMap { key, values in
+        guard let first = values.first, let aggregate = aggregateTradeValues(values) else { return nil }
+        let chartDate = marketTradingDayDate(for: first.date)
+        return FreshTradeEvent(
+            id: key,
+            date: chartDate,
+            price: aggregate.price,
+            count: values.count,
+            quantity: aggregate.quantity,
+            amount: aggregate.amount,
+            direction: first.quantity < 0 ? .sell : .buy
+        )
+    }.sorted { $0.date < $1.date }
+}
+
+private struct TradeExecutionBand: View {
+    let events: [FreshTradeEvent]
+    let dateDomain: ClosedRange<Date>
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .topLeading) {
+                ForEach(events) { event in
+                    VStack(spacing: 1) {
+                        Text("\(event.date.formatted(.dateTime.month(.defaultDigits).day())) · \(event.direction == .buy ? "买" : "卖")\(event.count)")
+                            .foregroundStyle(event.direction == .buy ? QDesign.positive : QDesign.negative)
+                        Text("金额 $\(event.amount, specifier: "%.2f")")
+                            .foregroundStyle(QDesign.secondary)
+                    }
+                    .font(.system(size: 7, weight: .medium, design: .rounded))
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .frame(width: 48)
+                    .position(x: xPosition(for: event.date, width: geometry.size.width), y: 11)
+                    .help(executionHelp(event))
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(executionHelp(event))
+                }
+            }
+        }
+        .frame(height: events.isEmpty ? 0 : 24)
+    }
+
+    private func xPosition(for date: Date, width: CGFloat) -> CGFloat {
+        let duration = dateDomain.upperBound.timeIntervalSince(dateDomain.lowerBound)
+        guard duration > 0 else { return width / 2 }
+        let progress = date.timeIntervalSince(dateDomain.lowerBound) / duration
+        return min(max(CGFloat(progress) * width, 25), max(25, width - 25))
+    }
+
+    private func executionHelp(_ event: FreshTradeEvent) -> String {
+        let side = event.direction == .buy ? "买入" : "卖出"
+        return "\(event.date.formatted(.dateTime.year().month().day())) · \(side) \(event.count) 笔 · \(String(format: "%.4f", event.quantity)) 股 · $\(String(format: "%.2f", event.amount))"
+    }
 }
 
 private struct DecisionPriceChart: View {
@@ -1282,88 +1371,122 @@ private struct DecisionPriceChart: View {
         guard let selectedDate else { return nil }
         return snapshot.priceHistory.min { abs($0.date.timeIntervalSince(selectedDate)) < abs($1.date.timeIntervalSince(selectedDate)) }
     }
-    private var tradeEvents: [FreshTradeEvent] {
-        let markers = snapshot.buyMarkers.filter { dateDomain.contains($0.date) }
-        let grouped = Dictionary(grouping: markers) { marker in
-            let day = Calendar(identifier: .gregorian).startOfDay(for: marker.date)
-            return "\(day.timeIntervalSince1970)-\(marker.quantity < 0 ? "sell" : "buy")"
-        }
-        return grouped.compactMap { key, values in
-            guard let first = values.first else { return nil }
-            let quantity = values.reduce(0) { $0 + abs($1.quantity) }
-            let price = quantity > 0 ? values.reduce(0) { $0 + abs($1.quantity) * $1.price } / quantity : first.price
-            return FreshTradeEvent(id: key, date: first.date, price: price, count: values.count, direction: first.quantity < 0 ? .sell : .buy)
-        }.sorted { $0.date < $1.date }
+    private var tradeEvents: [FreshTradeEvent] { groupedTradeEvents(snapshot, within: dateDomain) }
+    private var middleDate: Date? {
+        guard !snapshot.priceHistory.isEmpty else { return nil }
+        return snapshot.priceHistory[snapshot.priceHistory.count / 2].date
+    }
+    private var selectedExecutions: [FreshTradeEvent] {
+        guard let selectedPoint else { return [] }
+        return tradeEvents.filter { Calendar.current.isDate($0.date, inSameDayAs: selectedPoint.date) }
     }
 
     var body: some View {
-        Chart {
+        VStack(spacing: 1) {
+            Chart {
             ForEach(snapshot.priceHistory) { point in
                 AreaMark(
                     x: .value("日期", point.date),
                     yStart: .value("基线", yDomain.lowerBound),
                     yEnd: .value("价格", point.close)
                 )
-                .foregroundStyle(LinearGradient(colors: [QDesign.accent.opacity(0.18), QDesign.accent.opacity(0.01)], startPoint: .top, endPoint: .bottom))
+                .foregroundStyle(LinearGradient(colors: [QDesign.accent.opacity(0.16), QDesign.accent.opacity(0.008)], startPoint: .top, endPoint: .bottom))
                 .interpolationMethod(.catmullRom)
 
                 LineMark(x: .value("日期", point.date), y: .value("价格", point.close), series: .value("系列", "QQQM"))
                     .foregroundStyle(QDesign.accent)
-                    .lineStyle(.init(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                    .lineStyle(.init(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
                     .interpolationMethod(.catmullRom)
             }
             ForEach(ema20) { point in
                 LineMark(x: .value("日期", point.date), y: .value("EMA20", point.close), series: .value("系列", "EMA20"))
-                    .foregroundStyle(QDesign.secondary.opacity(0.72))
-                    .lineStyle(.init(lineWidth: 1, lineCap: .round, dash: [3, 3]))
+                    .foregroundStyle(QDesign.secondary.opacity(0.66))
+                    .lineStyle(.init(lineWidth: 0.85, lineCap: .round, dash: [3, 3]))
                     .interpolationMethod(.catmullRom)
             }
-            if snapshot.portfolio.averageCost > 0 {
-                RuleMark(y: .value("平均成本", snapshot.portfolio.averageCost))
-                    .foregroundStyle(QDesign.caution.opacity(0.72))
-                    .lineStyle(.init(lineWidth: 0.9, dash: [5, 3]))
-            }
+                if snapshot.portfolio.averageCost > 0 {
+                    RuleMark(y: .value("平均成本", snapshot.portfolio.averageCost))
+                        .foregroundStyle(QDesign.caution.opacity(0.74))
+                        .lineStyle(.init(lineWidth: 0.85, dash: [5, 3]))
+                }
             ForEach(tradeEvents) { event in
-                PointMark(x: .value("成交日", event.date), y: .value("成交价", event.price))
-                    .symbol {
-                        Text(event.direction == .buy ? "B" : "S")
-                            .font(.system(size: 7, weight: .bold, design: .rounded))
-                            .foregroundStyle(.white)
-                            .frame(width: 15, height: 15)
-                            .background(event.direction == .buy ? QDesign.positive : QDesign.negative, in: Circle())
-                            .overlay(Circle().stroke(Color.white.opacity(0.75), lineWidth: 0.7))
-                            .help("\(event.direction == .buy ? "买入" : "卖出") \(event.count) 笔 · $\(event.price, specifier: "%.2f")")
-                    }
+                RuleMark(
+                    x: .value("成交日", event.date),
+                    yStart: .value("图表底部", yDomain.lowerBound),
+                    yEnd: .value("成交价", event.price)
+                )
+                .foregroundStyle((event.direction == .buy ? QDesign.positive : QDesign.negative).opacity(0.48))
+                .lineStyle(.init(lineWidth: 0.65, dash: [1.5, 2]))
             }
             if let last = snapshot.priceHistory.last {
                 PointMark(x: .value("最新日期", last.date), y: .value("最新价", last.close))
                     .symbol {
-                        Circle().fill(QDesign.surface).frame(width: 8, height: 8)
-                            .overlay(Circle().stroke(QDesign.accent, lineWidth: 2))
+                        Circle().fill(QDesign.surface).frame(width: 5.5, height: 5.5)
+                            .overlay(Circle().stroke(QDesign.accent, lineWidth: 1.2))
                     }
             }
             if let selectedPoint {
                 RuleMark(x: .value("选中日期", selectedPoint.date))
-                    .foregroundStyle(QDesign.secondary.opacity(0.5))
-                    .lineStyle(.init(lineWidth: 0.7, dash: [2, 2]))
+                    .foregroundStyle(QDesign.secondary.opacity(0.42))
+                    .lineStyle(.init(lineWidth: 0.65, dash: [2, 2]))
                 PointMark(x: .value("选中日期", selectedPoint.date), y: .value("选中价格", selectedPoint.close))
                     .foregroundStyle(QDesign.primary)
-                    .symbolSize(28)
+                    .symbolSize(22)
                     .annotation(position: .top, spacing: 4) {
-                        Text("\(selectedPoint.date.formatted(.dateTime.month(.defaultDigits).day()))  $\(selectedPoint.close, specifier: "%.2f")")
-                            .font(.system(size: 9, weight: .medium, design: .rounded))
-                            .padding(.horizontal, 7).padding(.vertical, 4)
-                            .background(.regularMaterial, in: Capsule())
+                        selectionPopover(selectedPoint)
                     }
             }
         }
-        .chartXScale(domain: dateDomain)
-        .chartYScale(domain: yDomain)
-        .chartLegend(.hidden)
-        .chartXAxis(.hidden)
-        .chartYAxis(.hidden)
-        .chartXSelection(value: $selectedDate)
-        .accessibilityLabel("QQQM 最近三十个交易日收盘价、二十日指数均线与真实成交点")
+            .chartXScale(domain: dateDomain)
+            .chartYScale(domain: yDomain)
+            .chartLegend(.hidden)
+            .chartXAxis(.hidden)
+            .chartYAxis {
+                AxisMarks(position: .trailing, values: .automatic(desiredCount: 4)) { value in
+                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.45, dash: [2, 3]))
+                        .foregroundStyle(QDesign.separator.opacity(0.44))
+                    AxisValueLabel {
+                        if let price = value.as(Double.self) {
+                            Text("\(price, specifier: "%.0f")")
+                        }
+                    }
+                    .font(.system(size: 7, weight: .medium, design: .rounded))
+                    .foregroundStyle(QDesign.tertiary)
+                }
+            }
+            .chartXSelection(value: $selectedDate)
+            .frame(height: 128)
+
+            HStack {
+                Text(snapshot.priceHistory.first?.date ?? snapshot.lastUpdated, format: .dateTime.month(.defaultDigits).day())
+                Spacer()
+                Text(middleDate ?? snapshot.lastUpdated, format: .dateTime.month(.defaultDigits).day())
+                Spacer()
+                Text(snapshot.priceHistory.last?.date ?? snapshot.lastUpdated, format: .dateTime.month(.defaultDigits).day())
+            }
+            .font(.system(size: 7.5, weight: .medium, design: .rounded))
+            .foregroundStyle(QDesign.secondary)
+            .padding(.trailing, 24)
+
+            TradeExecutionBand(events: tradeEvents, dateDomain: dateDomain)
+                .padding(.trailing, 24)
+        }
+        .accessibilityLabel("QQQM 最近三十个交易日收盘价、二十日指数均线与真实买卖成交价")
+    }
+
+    @ViewBuilder
+    private func selectionPopover(_ point: PricePoint) -> some View {
+        VStack(spacing: 1) {
+            Text("\(point.date.formatted(.dateTime.month(.defaultDigits).day()))  $\(point.close, specifier: "%.2f")")
+            ForEach(selectedExecutions) { event in
+                Text("\(event.direction == .buy ? "买入" : "卖出") \(event.count) 笔 · $\(event.price, specifier: "%.2f")/股 · 共 $\(event.amount, specifier: "%.2f")")
+                    .foregroundStyle(event.direction == .buy ? QDesign.positive : QDesign.negative)
+            }
+        }
+        .font(.system(size: 8, weight: .medium, design: .rounded))
+        .monospacedDigit()
+        .padding(.horizontal, 7).padding(.vertical, 4)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
     }
 }
 
@@ -1395,17 +1518,13 @@ private struct AllocationStepScale: View {
     var body: some View {
         VStack(spacing: 5) {
             ZStack {
-                Capsule().fill(QDesign.separator.opacity(0.72)).frame(height: 2)
+                Rectangle().fill(QDesign.separator.opacity(0.72)).frame(height: 1)
                 HStack(spacing: 0) {
                     ForEach(amounts, id: \.self) { amount in
                         let selected = abs(amount - selectedAmount) < 0.1
-                        ZStack {
-                            Circle()
-                                .fill(selected ? QDesign.accent : QDesign.surface)
-                                .frame(width: selected ? 13 : 8, height: selected ? 13 : 8)
-                                .overlay(Circle().stroke(selected ? QDesign.accent : QDesign.secondary.opacity(0.65), lineWidth: 1))
-                            if selected { Circle().fill(.white).frame(width: 4, height: 4) }
-                        }
+                        Capsule()
+                            .fill(selected ? QDesign.accent : QDesign.secondary.opacity(0.62))
+                            .frame(width: selected ? 3 : 1, height: selected ? 12 : 6)
                         .frame(maxWidth: .infinity)
                     }
                 }
@@ -1424,15 +1543,12 @@ private struct AllocationStepScale: View {
 }
 
 private struct FactorConditionRow: View {
-    @Environment(\.colorScheme) private var colorScheme
     let title: String
     let value: String
     let source: String
     let position: Double
     let status: String
     let tint: Color
-    let lowTint: Color
-    let highTint: Color
     let lowerBoundary: Double
     let upperBoundary: Double
 
@@ -1449,21 +1565,14 @@ private struct FactorConditionRow: View {
             .frame(width: 72, alignment: .leading)
 
             GeometryReader { proxy in
-                let availableWidth = max(0, proxy.size.width - 2)
                 ZStack(alignment: .leading) {
-                    HStack(spacing: 1) {
-                        Rectangle().fill(lowTint.opacity(colorScheme == .dark ? 0.34 : 0.24))
-                            .frame(width: availableWidth * lowBoundary)
-                        Rectangle().fill(QDesign.track)
-                            .frame(width: availableWidth * (highBoundary - lowBoundary))
-                        Rectangle().fill(highTint.opacity(colorScheme == .dark ? 0.34 : 0.24))
-                    }
-                    .frame(height: 5)
-                    .clipShape(Capsule())
-                    Circle().fill(tint).frame(width: 9, height: 9)
-                        .overlay(Circle().stroke(QDesign.elevated, lineWidth: 1.5))
-                        .shadow(color: tint.opacity(0.22), radius: 2)
-                        .offset(x: max(0, min(proxy.size.width - 9, proxy.size.width * clamped - 4.5)))
+                    Capsule().fill(QDesign.track).frame(height: 2)
+                    Rectangle().fill(QDesign.separator).frame(width: 1, height: 7)
+                        .offset(x: proxy.size.width * lowBoundary)
+                    Rectangle().fill(QDesign.separator).frame(width: 1, height: 7)
+                        .offset(x: proxy.size.width * highBoundary)
+                    Circle().fill(tint).frame(width: 7, height: 7)
+                        .offset(x: max(0, min(proxy.size.width - 7, proxy.size.width * clamped - 3.5)))
                 }
                 .frame(maxHeight: .infinity)
             }
@@ -1480,7 +1589,6 @@ private struct FactorConditionRow: View {
 }
 
 private struct TierTransitionView: View {
-    @Environment(\.colorScheme) private var colorScheme
     let moreDetail: String
     let lessDetail: String
     let moreReached: Bool
@@ -1504,23 +1612,9 @@ private struct TierTransitionView: View {
                 tint: QDesign.caution
             )
         }
-        .padding(.vertical, 7)
-        .background {
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            QDesign.positive.opacity(colorScheme == .dark ? 0.075 : 0.045),
-                            QDesign.caution.opacity(colorScheme == .dark ? 0.065 : 0.038)
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                )
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .stroke(QDesign.separator.opacity(0.28), lineWidth: 0.35)
+        .padding(.top, 8)
+        .overlay(alignment: .top) {
+            Rectangle().fill(QDesign.separator.opacity(0.55)).frame(height: 0.5)
         }
     }
 
@@ -1535,8 +1629,6 @@ private struct TierTransitionView: View {
                 Text(logic)
                     .font(.system(size: 6.5, weight: .bold))
                     .foregroundStyle(tint)
-                    .padding(.horizontal, 4).padding(.vertical, 1)
-                    .background(tint.opacity(0.11), in: Capsule())
             }
             Text(detail)
                 .font(.system(size: 7.5, design: .rounded))
@@ -1559,16 +1651,19 @@ private struct FundsCoverageRail: View {
 
     var body: some View {
         VStack(spacing: 4) {
-            HStack(spacing: 4) {
-                ForEach(0..<4, id: \.self) { index in
-                    GeometryReader { proxy in
-                        let fill = min(max(coverage - Double(index), 0), 1)
-                        ZStack(alignment: .leading) {
-                            RoundedRectangle(cornerRadius: 2.5, style: .continuous).fill(QDesign.track)
-                            RoundedRectangle(cornerRadius: 2.5, style: .continuous)
-                                .fill(index == 0 ? QDesign.accent : QDesign.positive)
-                                .frame(width: proxy.size.width * fill)
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(QDesign.track)
+                    Capsule().fill(QDesign.positive.opacity(0.78))
+                        .frame(width: proxy.size.width * min(coverage / 4, 1))
+                    Capsule().fill(QDesign.accent)
+                        .frame(width: proxy.size.width * min(min(coverage, 1) / 4, 1))
+                    HStack(spacing: 0) {
+                        ForEach(0..<3, id: \.self) { _ in
+                            Spacer()
+                            Rectangle().fill(QDesign.surface.opacity(0.82)).frame(width: 1)
                         }
+                        Spacer()
                     }
                 }
             }
@@ -1661,17 +1756,14 @@ struct MenuPopoverView: View {
     }
 
     private func content(_ snapshot: QQQMSnapshot) -> some View {
-        VStack(spacing: 8) {
 #if QQQMBAR_RENDER_TEST
-            decisionDocument(snapshot)
+        decisionDocument(snapshot)
 #else
-            ScrollView(.vertical) {
-                decisionDocument(snapshot).padding(.bottom, 1)
-            }
-            .scrollIndicators(.hidden)
-#endif
-            footer(snapshot)
+        ScrollView(.vertical) {
+            decisionDocument(snapshot).padding(.bottom, 1)
         }
+        .scrollIndicators(.hidden)
+#endif
     }
 
     private func decisionDocument(_ snapshot: QQQMSnapshot) -> some View {
@@ -1684,6 +1776,8 @@ struct MenuPopoverView: View {
                 evidencePanel(snapshot)
                 sectionDivider
                 portfolioPanel(snapshot)
+                sectionDivider
+                footer(snapshot)
             }
         }
     }
@@ -1699,12 +1793,12 @@ struct MenuPopoverView: View {
         VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .top, spacing: 10) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("本期分档计划")
+                        Text("本周投入")
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(QDesign.secondary)
                         HStack(alignment: .firstTextBaseline, spacing: 6) {
                             Text(usd(snapshot.recommendation.recommendedAmount))
-                                .font(.system(size: 27, weight: .semibold, design: .rounded))
+                                .font(.system(size: 29, weight: .medium, design: .rounded))
                                 .monospacedDigit()
                             Text("\(snapshot.recommendation.multiplier, specifier: "%.2f")×")
                                 .font(.system(size: 11, weight: .medium, design: .rounded))
@@ -1766,24 +1860,14 @@ struct MenuPopoverView: View {
                     costDeviation: costDeviation(snapshot),
                     valuation: signal(snapshot, 3).value
                 )
-                DecisionPriceChart(snapshot: snapshot).frame(height: 118)
-                HStack {
-                    Text(snapshot.priceHistory.first?.date ?? snapshot.lastUpdated, format: .dateTime.month(.defaultDigits).day())
-                    Spacer()
-                    Text("拖动图表查看收盘价")
-                    Spacer()
-                    Text(snapshot.priceHistory.last?.date ?? snapshot.lastUpdated, format: .dateTime.month(.defaultDigits).day())
-                }
-                .font(.system(size: 8.5)).foregroundStyle(QDesign.tertiary)
-                HStack(spacing: 12) {
+                DecisionPriceChart(snapshot: snapshot)
+                HStack(spacing: 10) {
                     chartLegend(color: QDesign.accent, label: "收盘价")
                     chartLegend(color: QDesign.secondary, label: "EMA20", dashed: true)
                     chartLegend(color: QDesign.caution, label: "成本 \(usd(snapshot.portfolio.averageCost, decimals: 2))", dashed: true)
                     Spacer()
-                    Text("B \(snapshot.buyMarkers.filter { $0.quantity > 0 }.count)")
-                        .foregroundStyle(QDesign.positive)
-                    Text("S \(snapshot.buyMarkers.filter { $0.quantity < 0 }.count)")
-                        .foregroundStyle(QDesign.negative)
+                    tradeCount(.buy, count: snapshot.buyMarkers.filter { $0.quantity > 0 }.count)
+                    tradeCount(.sell, count: snapshot.buyMarkers.filter { $0.quantity < 0 }.count)
                 }
                 .font(.system(size: 9, weight: .medium, design: .rounded))
         }
@@ -1812,8 +1896,6 @@ struct MenuPopoverView: View {
                     position: trendPosition(snapshot),
                     status: trendStatus(snapshot),
                     tint: trendTint(snapshot),
-                    lowTint: QDesign.positive,
-                    highTint: QDesign.caution,
                     lowerBoundary: 0.20,
                     upperBoundary: 0.72
                 )
@@ -1824,8 +1906,6 @@ struct MenuPopoverView: View {
                     position: vixPosition(snapshot),
                     status: vixStatus(snapshot),
                     tint: vixTint(snapshot),
-                    lowTint: QDesign.caution,
-                    highTint: QDesign.positive,
                     lowerBoundary: 4.0 / 14.0,
                     upperBoundary: 7.0 / 14.0
                 )
@@ -1836,8 +1916,6 @@ struct MenuPopoverView: View {
                     position: sentimentPosition(snapshot),
                     status: sentimentStatus(snapshot),
                     tint: sentimentTint(snapshot),
-                    lowTint: QDesign.positive,
-                    highTint: QDesign.caution,
                     lowerBoundary: 0.30,
                     upperBoundary: 0.80
                 )
@@ -1920,7 +1998,9 @@ struct MenuPopoverView: View {
                             .foregroundStyle(snapshot.verifiedUnrealizedPnL >= 0 ? QDesign.positive : QDesign.negative)
                     }
                 }
-                Divider()
+                Rectangle()
+                    .fill(QDesign.separator.opacity(0.60))
+                    .frame(height: 0.45)
                 CashFlowEquation(
                     availableFunds: snapshot.portfolio.availableFunds,
                     planAmount: snapshot.recommendation.recommendedAmount
@@ -1945,25 +2025,30 @@ struct MenuPopoverView: View {
             .help(model.marketError ?? status.detail)
             Spacer()
             if model.planConfirmed {
-                Label("已确认", systemImage: "checkmark.circle.fill")
+                Label("本期已确认", systemImage: "checkmark")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(QDesign.positive)
-                    .frame(width: 128, height: 34)
-                    .background(QDesign.positive.opacity(0.12), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .frame(width: 136, height: 34)
+                    .background(QDesign.positive.opacity(0.09), in: RoundedRectangle(cornerRadius: QDesign.innerRadius, style: .continuous))
             } else {
                 Button { model.confirmPlan() } label: {
-                    Label("确认计划 \(usd(snapshot.recommendation.recommendedAmount))", systemImage: "checkmark.circle")
-                        .font(.system(size: 11, weight: .semibold))
-                        .frame(width: 128, height: 34)
+                    HStack(spacing: 7) {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 9, weight: .bold))
+                        Text("确认计划 \(usd(snapshot.recommendation.recommendedAmount))")
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(QDesign.accent)
+                    .frame(width: 136, height: 34)
+                    .background(QDesign.accent.opacity(colorScheme == .dark ? 0.10 : 0.08), in: RoundedRectangle(cornerRadius: QDesign.innerRadius, style: .continuous))
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .tint(QDesign.accent)
+                .buttonStyle(PrimaryActionButtonStyle())
                 .keyboardShortcut(.return, modifiers: [])
                 .help("仅保存本地确认记录，不会创建或提交交易订单。")
             }
         }
-        .padding(.horizontal, 2)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
     }
 
     private func dataStatus(_ snapshot: QQQMSnapshot) -> (icon: String, title: String, detail: String, tint: Color) {
@@ -1981,11 +2066,14 @@ struct MenuPopoverView: View {
     }
 
     private func statusPill(_ snapshot: QQQMSnapshot) -> some View {
-        Label(model.planConfirmed ? "已确认" : snapshot.recommendation.kind.label, systemImage: model.planConfirmed ? "checkmark.circle.fill" : "calendar.badge.clock")
-            .font(.system(size: 9, weight: .semibold))
-            .foregroundStyle(model.planConfirmed ? QDesign.positive : recommendationTint(snapshot.recommendation.kind))
-            .padding(.horizontal, 7).padding(.vertical, 4)
-            .background((model.planConfirmed ? QDesign.positive : recommendationTint(snapshot.recommendation.kind)).opacity(0.11), in: Capsule())
+        HStack(spacing: 5) {
+            Circle()
+                .fill(model.planConfirmed ? QDesign.positive : recommendationTint(snapshot.recommendation.kind))
+                .frame(width: 5, height: 5)
+            Text(model.planConfirmed ? "已确认" : snapshot.recommendation.kind.label)
+        }
+        .font(.system(size: 9, weight: .semibold))
+        .foregroundStyle(model.planConfirmed ? QDesign.positive : recommendationTint(snapshot.recommendation.kind))
     }
 
     private func chartLegend(color: Color, label: String, dashed: Bool = false) -> some View {
@@ -1994,6 +2082,12 @@ struct MenuPopoverView: View {
             if dashed { Capsule().fill(color).frame(width: 4, height: 2) }
             Text(label).foregroundStyle(QDesign.secondary)
         }
+    }
+
+    private func tradeCount(_ direction: TradeDirection, count: Int) -> some View {
+        Text("\(direction == .buy ? "买入" : "卖出") \(count)")
+            .foregroundStyle(count == 0 ? QDesign.tertiary : (direction == .buy ? QDesign.positive : QDesign.negative))
+        .accessibilityLabel("\(direction == .buy ? "买入" : "卖出") \(count) 笔")
     }
 
     private func signal(_ snapshot: QQQMSnapshot, _ index: Int) -> MarketSignal {
@@ -2124,7 +2218,7 @@ struct MenuPopoverView: View {
     private func costRelationship(_ snapshot: QQQMSnapshot) -> String {
         let delta = snapshot.quote.lastPrice - snapshot.portfolio.averageCost
         if abs(delta) < 0.005 { return "接近成本" }
-        return "\(delta > 0 ? "高于" : "低于") \(usd(abs(delta), decimals: 2))"
+        return "\(delta > 0 ? "高于成本" : "低于成本") \(usd(abs(delta), decimals: 2))"
     }
     private func costRelationshipTint(_ snapshot: QQQMSnapshot) -> Color {
         snapshot.quote.lastPrice >= snapshot.portfolio.averageCost ? QDesign.positive : QDesign.negative
@@ -2468,6 +2562,18 @@ struct QQQMBarSelfTest {
         precondition(dcaReminderTitle(nextExecution: calendar.date(byAdding: .day, value: 1, to: now), confirmed: false, hasError: false, now: now) == "明日")
         precondition(dcaReminderTitle(nextExecution: now, confirmed: false, hasError: false, now: now) == "今日")
         precondition(dcaReminderTitle(nextExecution: now, confirmed: true, hasError: false, now: now) == "✓")
+        let sameSessionMorning = ISO8601DateFormatter().date(from: "2026-08-18T14:59:39Z")!
+        let sameSessionAfternoon = ISO8601DateFormatter().date(from: "2026-08-18T19:52:17Z")!
+        let nextShanghaiDay = ISO8601DateFormatter().date(from: "2026-08-25T19:52:47Z")!
+        precondition(marketTradingDayDate(for: sameSessionMorning) == marketTradingDayDate(for: sameSessionAfternoon))
+        precondition(marketTradingDayDate(for: sameSessionMorning).formatted(.iso8601) == "2026-08-18T00:00:00Z")
+        precondition(marketTradingDayDate(for: nextShanghaiDay).formatted(.iso8601) == "2026-08-25T00:00:00Z")
+        let groupedTrade = aggregateTradeValues([
+            BuyMarker(id: "a", date: sameSessionMorning, price: 295.0195, quantity: 1, amount: 295.0195),
+            BuyMarker(id: "b", date: sameSessionAfternoon, price: 295.686093, quantity: 1.3527, amount: 399.9745780011)
+        ])!
+        precondition(abs(groupedTrade.amount - 694.9940780011) < 0.000001)
+        precondition(abs(groupedTrade.price - 295.4027619336) < 0.0001)
         print("QQQMBAR SELF TEST: PASS")
     }
 }
