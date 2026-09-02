@@ -42,14 +42,16 @@ struct DataSourceInfo: Codable, Hashable {
     let notes: String?
     let accountSource: String?
     let accountAsOf: Date?
+    let refreshCompletedAt: Date?
 
-    init(name: String, mode: SnapshotMode, asOf: Date, notes: String?, accountSource: String? = nil, accountAsOf: Date? = nil) {
+    init(name: String, mode: SnapshotMode, asOf: Date, notes: String?, accountSource: String? = nil, accountAsOf: Date? = nil, refreshCompletedAt: Date? = nil) {
         self.name = name
         self.mode = mode
         self.asOf = asOf
         self.notes = notes
         self.accountSource = accountSource
         self.accountAsOf = accountAsOf
+        self.refreshCompletedAt = refreshCompletedAt
     }
 }
 
@@ -201,7 +203,11 @@ private func dcaAllocationBand(momentum: Double, vix: Double?, sentimentScore: D
 private enum MarketRefreshSchedule {
     static let marketTimeZone = TimeZone(identifier: "America/New_York")!
     static let hour = 16
-    static let minute = 15
+    static let minute = 5
+    static let initialRetryInterval: TimeInterval = 5 * 60
+    static let lateRetryInterval: TimeInterval = 30 * 60
+    static let retryCutoffHour = 20
+    static let retryCutoffMinute = 15
 
     static func nextRefresh(after date: Date) -> Date {
         scheduledDate(relativeTo: date, direction: 1, includeCurrent: false)
@@ -216,6 +222,41 @@ private enum MarketRefreshSchedule {
         return lastRefresh < mostRecentRefresh(onOrBefore: now)
     }
 
+    static func expectedSessionDate(at date: Date) -> Date {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = marketTimeZone
+        let today = calendar.startOfDay(for: date)
+        let scheduledToday = calendar.date(bySettingHour: hour, minute: minute, second: 0, of: today)!
+        var candidate = date >= scheduledToday ? today : calendar.date(byAdding: .day, value: -1, to: today)!
+        while !isTradingDay(candidate, calendar: calendar) {
+            candidate = calendar.date(byAdding: .day, value: -1, to: candidate)!
+        }
+        return utcDate(forMarketDay: candidate, calendar: calendar)
+    }
+
+    static func isFresh(marketDate: Date?, now: Date = Date()) -> Bool {
+        guard let marketDate else { return false }
+        return utcDayKey(marketDate) >= utcDayKey(expectedSessionDate(at: now))
+    }
+
+    static func marketSessionDate(for timestamp: Date) -> Date {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = marketTimeZone
+        return utcDate(forMarketDay: timestamp, calendar: calendar)
+    }
+
+    static func retryDate(after date: Date) -> Date? {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = marketTimeZone
+        let day = calendar.startOfDay(for: date)
+        guard isTradingDay(day, calendar: calendar),
+              let cutoff = calendar.date(bySettingHour: retryCutoffHour, minute: retryCutoffMinute, second: 0, of: day),
+              date < cutoff else { return nil }
+        let firstWindowEnd = calendar.date(bySettingHour: 16, minute: 20, second: 0, of: day)!
+        let interval = date < firstWindowEnd ? initialRetryInterval : lateRetryInterval
+        return min(date.addingTimeInterval(interval), cutoff)
+    }
+
     private static func scheduledDate(relativeTo date: Date, direction: Int, includeCurrent: Bool) -> Date {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = marketTimeZone
@@ -225,7 +266,7 @@ private enum MarketRefreshSchedule {
             guard let day = calendar.date(byAdding: .day, value: offset, to: start),
                   let candidate = calendar.date(bySettingHour: hour, minute: minute, second: 0, of: day) else { continue }
             let weekday = calendar.component(.weekday, from: candidate)
-            guard (2...6).contains(weekday) else { continue }
+            guard (2...6).contains(weekday), isTradingDay(candidate, calendar: calendar) else { continue }
             if direction > 0 {
                 if candidate > date || (includeCurrent && candidate == date) { return candidate }
             } else if candidate < date || (includeCurrent && candidate == date) {
@@ -233,6 +274,80 @@ private enum MarketRefreshSchedule {
             }
         }
         return date.addingTimeInterval(Double(direction) * 86_400)
+    }
+
+    private static func isTradingDay(_ date: Date, calendar: Calendar) -> Bool {
+        let weekday = calendar.component(.weekday, from: date)
+        guard (2...6).contains(weekday) else { return false }
+        return !marketHolidays(in: calendar.component(.year, from: date), calendar: calendar).contains(calendar.startOfDay(for: date))
+    }
+
+    private static func marketHolidays(in year: Int, calendar: Calendar) -> Set<Date> {
+        func date(_ month: Int, _ day: Int) -> Date {
+            calendar.date(from: DateComponents(year: year, month: month, day: day))!
+        }
+        func observed(_ date: Date) -> Date {
+            switch calendar.component(.weekday, from: date) {
+            case 7: return calendar.date(byAdding: .day, value: -1, to: date)!
+            case 1: return calendar.date(byAdding: .day, value: 1, to: date)!
+            default: return date
+            }
+        }
+        func nthWeekday(_ weekday: Int, month: Int, ordinal: Int) -> Date {
+            var components = DateComponents(year: year, month: month, weekday: weekday, weekdayOrdinal: ordinal)
+            components.calendar = calendar
+            return calendar.date(from: components)!
+        }
+        func lastWeekday(_ weekday: Int, month: Int) -> Date {
+            var components = DateComponents(year: year, month: month + 1, day: 0)
+            components.calendar = calendar
+            var value = calendar.date(from: components)!
+            while calendar.component(.weekday, from: value) != weekday {
+                value = calendar.date(byAdding: .day, value: -1, to: value)!
+            }
+            return value
+        }
+        func easterSunday() -> Date {
+            let a = year % 19, b = year / 100, c = year % 100
+            let d = b / 4, e = b % 4, f = (b + 8) / 25, g = (b - f + 1) / 3
+            let h = (19 * a + b - d - g + 15) % 30
+            let i = c / 4, k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7
+            let m = (a + 11 * h + 22 * l) / 451
+            let month = (h + l - 7 * m + 114) / 31
+            let day = (h + l - 7 * m + 114) % 31 + 1
+            return date(month, day)
+        }
+
+        let newYear = observed(date(1, 1))
+        let nextNewYearObserved = observed(calendar.date(from: DateComponents(year: year + 1, month: 1, day: 1))!)
+        var holidays: Set<Date> = [
+            newYear,
+            nthWeekday(2, month: 1, ordinal: 3),
+            nthWeekday(2, month: 2, ordinal: 3),
+            calendar.date(byAdding: .day, value: -2, to: easterSunday())!,
+            lastWeekday(2, month: 5),
+            observed(date(6, 19)),
+            observed(date(7, 4)),
+            nthWeekday(2, month: 9, ordinal: 1),
+            nthWeekday(5, month: 11, ordinal: 4),
+            observed(date(12, 25))
+        ]
+        if calendar.component(.year, from: nextNewYearObserved) == year { holidays.insert(nextNewYearObserved) }
+        return Set(holidays.map { calendar.startOfDay(for: $0) })
+    }
+
+    private static func utcDate(forMarketDay date: Date, calendar: Calendar) -> Date {
+        let components = calendar.dateComponents([.year, .month, .day], from: date)
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(secondsFromGMT: 0)!
+        return utc.date(from: components)!
+    }
+
+    private static func utcDayKey(_ date: Date) -> Int {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let parts = calendar.dateComponents([.year, .month, .day], from: date)
+        return (parts.year ?? 0) * 10_000 + (parts.month ?? 0) * 100 + (parts.day ?? 0)
     }
 }
 
@@ -283,6 +398,36 @@ struct QQQMSnapshot: Codable, Hashable {
         return issues
     }
 
+    func freshnessIssues(at now: Date = Date()) -> [String] {
+        var issues: [String] = []
+        let expectedSession = MarketRefreshSchedule.expectedSessionDate(at: now)
+        func reachesExpectedSession(_ date: Date?) -> Bool {
+            guard let date else { return false }
+            return MarketRefreshSchedule.isFresh(marketDate: date, now: now)
+        }
+        if !reachesExpectedSession(priceHistory.last?.date) || !reachesExpectedSession(source.asOf) {
+            issues.append("QQQM 行情未更新到最新交易日")
+        }
+        if !reachesExpectedSession(recommendation.generatedAt) {
+            issues.append("定投结论未按最新交易日重算")
+        }
+        for id in ["live-momentum", "live-vix", "live-cnn-fear-greed"] {
+            guard let signal = signals.first(where: { $0.id == id }), reachesExpectedSession(signal.asOf) else {
+                let label = id == "live-vix" ? "VIX" : (id == "live-cnn-fear-greed" ? "CNN 指数" : "趋势")
+                issues.append("\(label) 未更新到最新交易日")
+                continue
+            }
+        }
+        if source.accountSource != nil {
+            guard let accountAsOf = source.accountAsOf,
+                  MarketRefreshSchedule.marketSessionDate(for: accountAsOf) >= expectedSession else {
+                issues.append("IBKR 账户未同步到最新交易日")
+                return issues
+            }
+        }
+        return issues
+    }
+
     static let fixture: QQQMSnapshot = {
         func date(_ value: String) -> Date { ISO8601DateFormatter().date(from: value + "T13:30:00Z")! }
         let history = [
@@ -320,13 +465,32 @@ struct QQQMSnapshot: Codable, Hashable {
 enum LiveMarketDataError: LocalizedError {
     case invalidResponse(String)
     case insufficientHistory(Int)
+    case staleMarketDate(expected: Date, received: Date?)
 
     var errorDescription: String? {
         switch self {
         case .invalidResponse(let source): "\(source) 返回的数据无法解析"
         case .insufficientHistory(let count): "Nasdaq 日线数量不足：\(count)"
+        case .staleMarketDate(let expected, let received):
+            "Nasdaq 尚未发布 \(Self.dayLabel(expected)) 收盘数据（当前最新：\(received.map(Self.dayLabel) ?? "无")），稍后自动重试"
         }
     }
+
+    private static func dayLabel(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "M月d日"
+        return formatter.string(from: date)
+    }
+}
+
+struct NasdaqOfficialClose: Hashable {
+    let date: Date
+    let close: Double
+    let previousClose: Double
+    let low: Double?
+    let high: Double?
 }
 
 struct VIXObservation: Hashable {
@@ -350,20 +514,40 @@ struct CNNFearGreedObservation: Hashable {
     }
 }
 
+struct CNNMarketObservation: Hashable {
+    let fearGreed: CNNFearGreedObservation
+    let vix: VIXObservation
+}
+
 struct LiveMarketDataService {
     // Official fund fact sheet, Q1 2026. This is intentionally a dated
     // fundamental snapshot rather than a made-up real-time valuation score.
     static let officialPERatio = 36.52
     static let officialPEAsOf = ISO8601DateFormatter().date(from: "2026-03-31T20:00:00Z")!
 
-    func refreshedSnapshot(from current: QQQMSnapshot) async throws -> QQQMSnapshot {
+    func refreshedSnapshot(from current: QQQMSnapshot, now: Date = Date(), confirmedRecommendationID: String? = nil) async throws -> QQQMSnapshot {
         async let nasdaqTask = fetchNasdaqHistory()
-        async let vixTask = fetchLatestVIX()
-        async let cnnTask = fetchCNNFearGreed()
-        let allHistory = try await nasdaqTask
-        let vix = try? await vixTask
-        let cnn = try? await cnnTask
+        async let closeTask = fetchNasdaqOfficialClose()
+        async let fredVIXTask = fetchLatestVIX()
+        async let cnnTask = fetchCNNMarketObservation()
+        var allHistory = try await nasdaqTask
+        let officialClose = try await closeTask
+        let cnnMarket = try? await cnnTask
+        let fredVIX = try? await fredVIXTask
+        let vix = cnnMarket?.vix ?? fredVIX
+        let cnn = cnnMarket?.fearGreed
+        if let index = allHistory.lastIndex(where: { Self.utcDayKey($0.date) == Self.utcDayKey(officialClose.date) }) {
+            allHistory[index] = PricePoint(date: officialClose.date, close: officialClose.close)
+        } else if allHistory.last.map({ Self.utcDayKey($0.date) < Self.utcDayKey(officialClose.date) }) ?? true {
+            allHistory.append(PricePoint(date: officialClose.date, close: officialClose.close))
+        }
+        allHistory.sort { $0.date < $1.date }
         guard allHistory.count >= 30 else { throw LiveMarketDataError.insufficientHistory(allHistory.count) }
+
+        let expectedSession = MarketRefreshSchedule.expectedSessionDate(at: now)
+        guard MarketRefreshSchedule.isFresh(marketDate: allHistory.last?.date, now: now) else {
+            throw LiveMarketDataError.staleMarketDate(expected: expectedSession, received: allHistory.last?.date)
+        }
 
         let chartHistory = Array(allHistory.suffix(30))
         guard let latest = allHistory.last, allHistory.count >= 2 else {
@@ -371,7 +555,6 @@ struct LiveMarketDataService {
         }
         let previous = allHistory[allHistory.count - 2]
         let yearStart = allHistory.first!
-        let dayRow = try await fetchLatestNasdaqBar()
         let dayChange = (latest.close / previous.close - 1) * 100
         let ytd = (latest.close / yearStart.close - 1) * 100
         let volatility = annualizedVolatility(Array(allHistory.suffix(31)).map(\.close))
@@ -387,6 +570,7 @@ struct LiveMarketDataService {
         let recommendation = liveRecommendation(
             from: current.recommendation,
             marketDate: latest.date,
+            confirmedRecommendationID: confirmedRecommendationID,
             momentum: momentum,
             vix: vix?.value,
             sentimentScore: sentimentScore,
@@ -405,9 +589,10 @@ struct LiveMarketDataService {
             availableFunds: current.portfolio.availableFunds
         )
         let vixValue = vix.map { String(format: "%.1f", $0.value) } ?? "—"
-        let vixSource = vix.map { "FRED · \($0.date.formatted(.dateTime.month(.defaultDigits).day()))" } ?? "FRED 暂不可用"
+        let vixProvider = cnnMarket?.vix == nil ? "FRED 后备" : "CNN VIX"
+        let vixSource = vix.map { "\(vixProvider) · \(Self.marketDayLabel($0.date))" } ?? "VIX 暂不可用"
         let accountNote = current.source.accountSource == nil ? "账户数据为本地快照。" : "账户数据由 IBKR 插件同步。"
-        let sourceNotes = "QQQM 日线：Nasdaq；VIX：FRED；恐惧与贪婪：CNN；P/E：Invesco Q1 2026。\(accountNote)"
+        let sourceNotes = "QQQM 收盘与日线：Nasdaq；VIX 与恐惧贪婪：CNN 同批次，FRED 仅后备；P/E：Invesco 最新官方季度数据。\(accountNote)"
         let cnnSignal: MarketSignal
         if let cnn {
             cnnSignal = MarketSignal(
@@ -437,18 +622,19 @@ struct LiveMarketDataService {
             schemaVersion: QQQMSnapshot.currentSchemaVersion,
             symbol: current.symbol,
             source: DataSourceInfo(
-                name: current.source.accountSource == nil ? "Nasdaq + FRED + Invesco" : "IBKR + Nasdaq + FRED + Invesco",
+                name: current.source.accountSource == nil ? "Nasdaq + CNN + Invesco" : "IBKR + Nasdaq + CNN + Invesco",
                 mode: .live,
                 asOf: latest.date,
                 notes: sourceNotes,
                 accountSource: current.source.accountSource,
-                accountAsOf: current.source.accountAsOf
+                accountAsOf: current.source.accountAsOf,
+                refreshCompletedAt: now
             ),
             quote: QuoteSnapshot(
                 lastPrice: latest.close,
                 dayChangePct: dayChange,
-                dayLow: dayRow.low,
-                dayHigh: dayRow.high,
+                dayLow: officialClose.low,
+                dayHigh: officialClose.high,
                 ytdChangePct: ytd,
                 annualizedVol30D: volatility
             ),
@@ -484,15 +670,23 @@ struct LiveMarketDataService {
         return (low, high)
     }
 
+    func fetchNasdaqOfficialClose() async throws -> NasdaqOfficialClose {
+        let infoURL = URL(string: "https://api.nasdaq.com/api/quote/QQQM/info?assetclass=etf")!
+        let summaryURL = URL(string: "https://api.nasdaq.com/api/quote/QQQM/summary?assetclass=etf")!
+        async let infoData = request(infoURL, referer: "https://www.nasdaq.com/")
+        async let summaryData = request(summaryURL, referer: "https://www.nasdaq.com/")
+        return try Self.parseNasdaqOfficialClose(infoData: await infoData, summaryData: await summaryData)
+    }
+
     func fetchLatestVIX() async throws -> VIXObservation {
         let url = URL(string: "https://fred.stlouisfed.org/graph/fredgraph.csv?id=VIXCLS")!
         return try Self.parseLatestVIX(try await request(url))
     }
 
-    func fetchCNNFearGreed() async throws -> CNNFearGreedObservation {
+    func fetchCNNMarketObservation() async throws -> CNNMarketObservation {
         let url = URL(string: "https://production.dataviz.cnn.io/index/fearandgreed/graphdata")!
         let data = try await request(url, referer: "https://www.cnn.com/markets/fear-and-greed", browserCompatible: true)
-        return try Self.parseCNNFearGreed(data)
+        return try Self.parseCNNMarketObservation(data)
     }
 
     private func request(_ url: URL, referer: String? = nil, browserCompatible: Bool = false) async throws -> Data {
@@ -523,6 +717,51 @@ struct LiveMarketDataService {
         return points
     }
 
+    static func parseNasdaqOfficialClose(infoData: Data, summaryData: Data) throws -> NasdaqOfficialClose {
+        guard let infoRoot = try JSONSerialization.jsonObject(with: infoData) as? [String: Any],
+              let info = infoRoot["data"] as? [String: Any],
+              let secondary = info["secondaryData"] as? [String: Any],
+              let timestamp = secondary["lastTradeTimestamp"] as? String,
+              let close = number(secondary["lastSalePrice"].map(String.init(describing:))),
+              timestamp.hasPrefix("Closed at ") else {
+            throw LiveMarketDataError.invalidResponse("Nasdaq 官方收盘价")
+        }
+        let dateFormatter = DateFormatter()
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateFormatter.timeZone = MarketRefreshSchedule.marketTimeZone
+        dateFormatter.dateFormat = "MMM d, yyyy h:mm a 'ET'"
+        guard let tradeDate = dateFormatter.date(from: String(timestamp.dropFirst("Closed at ".count))) else {
+            throw LiveMarketDataError.invalidResponse("Nasdaq 收盘时间")
+        }
+        var marketCalendar = Calendar(identifier: .gregorian)
+        marketCalendar.timeZone = MarketRefreshSchedule.marketTimeZone
+        let marketParts = marketCalendar.dateComponents([.year, .month, .day], from: tradeDate)
+        var utcCalendar = Calendar(identifier: .gregorian)
+        utcCalendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        guard let marketDate = utcCalendar.date(from: marketParts),
+              let summaryRoot = try JSONSerialization.jsonObject(with: summaryData) as? [String: Any],
+              let summary = summaryRoot["data"] as? [String: Any],
+              let summaryData = summary["summaryData"] as? [String: Any],
+              let previousEntry = summaryData["PreviousClose"] as? [String: Any],
+              let previousClose = number(previousEntry["value"].map(String.init(describing:))),
+              let rangeEntry = summaryData["TodayHighLow"] as? [String: Any],
+              let range = rangeEntry["value"] as? String else {
+            throw LiveMarketDataError.invalidResponse("Nasdaq 收盘摘要")
+        }
+        let bounds = range.split(separator: "/", omittingEmptySubsequences: false).compactMap { number(String($0)) }
+        // Nasdaq may publish the official close before it backfills the
+        // intraday range. A missing auxiliary range must not block the
+        // verified closing-price batch or make it look stale.
+        return NasdaqOfficialClose(date: marketDate, close: close, previousClose: previousClose, low: bounds.min(), high: bounds.max())
+    }
+
+    private static func utcDayKey(_ date: Date) -> Int {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let parts = calendar.dateComponents([.year, .month, .day], from: date)
+        return (parts.year ?? 0) * 10_000 + (parts.month ?? 0) * 100 + (parts.day ?? 0)
+    }
+
     static func parseLatestVIX(_ data: Data) throws -> VIXObservation {
         guard let csv = String(data: data, encoding: .utf8) else { throw LiveMarketDataError.invalidResponse("FRED VIX") }
         let formatter = DateFormatter()
@@ -548,6 +787,23 @@ struct LiveMarketDataService {
             throw LiveMarketDataError.invalidResponse("CNN 恐惧与贪婪指数")
         }
         return CNNFearGreedObservation(date: date, score: score, rating: rating)
+    }
+
+    static func parseCNNMarketObservation(_ data: Data) throws -> CNNMarketObservation {
+        let fearGreed = try parseCNNFearGreed(data)
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let volatility = root["market_volatility_vix"] as? [String: Any],
+              let rows = volatility["data"] as? [[String: Any]],
+              let latest = rows.last,
+              let timestampMilliseconds = latest["x"] as? Double,
+              let value = latest["y"] as? Double,
+              timestampMilliseconds.isFinite, value.isFinite, value > 0 else {
+            throw LiveMarketDataError.invalidResponse("CNN VIX")
+        }
+        return CNNMarketObservation(
+            fearGreed: fearGreed,
+            vix: VIXObservation(date: Date(timeIntervalSince1970: timestampMilliseconds / 1000), value: value)
+        )
     }
 
     private static func marketDayLabel(_ date: Date) -> String {
@@ -590,11 +846,22 @@ struct LiveMarketDataService {
         return 100 - 100 / (1 + gains / losses)
     }
 
-    private func liveRecommendation(from current: DCARecommendation, marketDate: Date, momentum: Double, vix: Double?, sentimentScore: Double, sentimentSource: String) -> DCARecommendation {
+    private func liveRecommendation(from current: DCARecommendation, marketDate: Date, confirmedRecommendationID: String?, momentum: Double, vix: Double?, sentimentScore: Double, sentimentSource: String) -> DCARecommendation {
         let baseAmount = 400.0
         let band = dcaAllocationBand(momentum: momentum, vix: vix, sentimentScore: sentimentScore)
         let amount = baseAmount * band.multiplier
-        let components = Calendar(identifier: .gregorian).dateComponents(in: TimeZone(secondsFromGMT: 0)!, from: current.nextExecution)
+        var nextExecution = current.nextExecution
+        if confirmedRecommendationID == current.id {
+            var marketCalendar = Calendar(identifier: .gregorian)
+            marketCalendar.timeZone = MarketRefreshSchedule.marketTimeZone
+            // Nasdaq market dates are encoded as UTC midnight; interpreting
+            // them again in New York would incorrectly shift them back a day.
+            let marketSession = marketDate
+            while MarketRefreshSchedule.marketSessionDate(for: nextExecution) <= marketSession {
+                nextExecution = marketCalendar.date(byAdding: .weekOfYear, value: 1, to: nextExecution)!
+            }
+        }
+        let components = Calendar(identifier: .gregorian).dateComponents(in: TimeZone(secondsFromGMT: 0)!, from: nextExecution)
         let executionDay = String(format: "%04d-%02d-%02d", components.year ?? 0, components.month ?? 0, components.day ?? 0)
         let vixText = vix.map { String(format: "%.1f", $0) } ?? "暂不可用"
         return DCARecommendation(
@@ -602,7 +869,7 @@ struct LiveMarketDataService {
             baseAmount: baseAmount,
             recommendedAmount: amount,
             kind: band.kind,
-            nextExecution: current.nextExecution,
+            nextExecution: nextExecution,
             generatedAt: marketDate,
             explanation: String(format: "US$400 分档规则：QQQM 30 日涨跌 %+.2f%%，VIX %@，%@ %.0f/100；当前为“%@”，采用 %.2f×，本期 US$%.0f。只提供计划提醒，不会自动下单。", momentum, vixText, sentimentSource, sentimentScore, band.label, band.multiplier, amount)
         )
@@ -717,7 +984,7 @@ final class AppModel: ObservableObject {
     private let previewMode: Bool
     private let lastMarketRefreshKey = "QQQMBar.lastSuccessfulMarketRefresh"
     private let marketDataRevisionKey = "QQQMBar.marketDataRevision"
-    private let marketDataRevision = "cnn-fear-greed-v1"
+    private let marketDataRevision = "synchronized-market-batch-v3"
 
     init(
         previewSnapshot: QQQMSnapshot? = nil,
@@ -746,6 +1013,7 @@ final class AppModel: ObservableObject {
 
     var iconState: GlyphState {
         guard let snapshot else { return .error }
+        if marketError != nil || !snapshot.auditIssues.isEmpty || !snapshot.freshnessIssues().isEmpty { return .error }
         if confirmation?.recommendationID == snapshot.recommendation.id { return .confirmed }
         switch snapshot.recommendation.kind {
         case .increase: return .increase
@@ -760,30 +1028,36 @@ final class AppModel: ObservableObject {
         do { snapshot = try store.load(); confirmation = try store.loadConfirmation(); loadError = nil }
         catch { snapshot = nil; confirmation = nil; loadError = error.localizedDescription }
     }
-    func refreshMarketDataIfDue(now: Date = Date()) async {
+    @discardableResult
+    func refreshMarketDataIfDue(now: Date = Date()) async -> Bool {
         let lastRefresh = UserDefaults.standard.object(forKey: lastMarketRefreshKey) as? Date
         let needsPipelineUpgrade = UserDefaults.standard.string(forKey: marketDataRevisionKey) != marketDataRevision
-        guard needsPipelineUpgrade || MarketRefreshSchedule.isDue(lastRefresh: lastRefresh, now: now) else { return }
-        await refreshMarketData(force: true)
+        let marketDataIsStale = !MarketRefreshSchedule.isFresh(marketDate: snapshot?.priceHistory.last?.date, now: now)
+        guard needsPipelineUpgrade || marketDataIsStale || MarketRefreshSchedule.isDue(lastRefresh: lastRefresh, now: now) else { return true }
+        return await refreshMarketData(force: true, now: now)
     }
-    func refreshMarketData(force: Bool = false) async {
-        guard !previewMode, !isRefreshing, let snapshot else { return }
+    @discardableResult
+    func refreshMarketData(force: Bool = false, now: Date = Date()) async -> Bool {
+        guard !previewMode, !isRefreshing, let snapshot else { return false }
         if !force {
             let lastRefresh = UserDefaults.standard.object(forKey: lastMarketRefreshKey) as? Date
-            guard MarketRefreshSchedule.isDue(lastRefresh: lastRefresh) else { return }
+            let marketDataIsStale = !MarketRefreshSchedule.isFresh(marketDate: snapshot.priceHistory.last?.date, now: now)
+            guard marketDataIsStale || MarketRefreshSchedule.isDue(lastRefresh: lastRefresh, now: now) else { return true }
         }
         isRefreshing = true
         defer { isRefreshing = false }
         do {
-            let refreshed = try await LiveMarketDataService().refreshedSnapshot(from: snapshot)
+            let refreshed = try await LiveMarketDataService().refreshedSnapshot(from: snapshot, now: now, confirmedRecommendationID: confirmation?.recommendationID)
             try store.save(refreshed)
             self.snapshot = refreshed
             UserDefaults.standard.set(Date(), forKey: lastMarketRefreshKey)
             UserDefaults.standard.set(marketDataRevision, forKey: marketDataRevisionKey)
             marketError = nil
             loadError = nil
+            return true
         } catch {
             marketError = "市场数据刷新失败：\(error.localizedDescription)"
+            return false
         }
     }
     func importSnapshot(from url: URL) {
@@ -893,6 +1167,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSPopoverDeleg
     private var outsideMouseMonitor: Any?
     private var localMouseMonitor: Any?
     private var marketRefreshTimer: Timer?
+    private var snapshotReloadTimer: Timer?
     private var outsideClicksEnabledAfter = TimeInterval.greatestFiniteMagnitude
     private let statusBadge = StatusBadgeView(frame: .zero)
 
@@ -927,20 +1202,32 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSPopoverDeleg
         }
 #if !QQQMBAR_INTERACTION_TEST
         Task { @MainActor [weak self] in
-            await self?.model.refreshMarketDataIfDue()
-            self?.scheduleNextMarketRefresh()
+            guard let self else { return }
+            let succeeded = await self.model.refreshMarketDataIfDue()
+            self.scheduleNextMarketRefresh(retrySoon: !succeeded)
+            self.scheduleLocalSnapshotReload()
         }
 #endif
     }
 
-    private func scheduleNextMarketRefresh() {
+    private func scheduleLocalSnapshotReload() {
+        snapshotReloadTimer?.invalidate()
+        let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.model.reload() }
+        }
+        snapshotReloadTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func scheduleNextMarketRefresh(retrySoon: Bool = false) {
         marketRefreshTimer?.invalidate()
-        let nextRefresh = MarketRefreshSchedule.nextRefresh(after: Date())
+        let now = Date()
+        let nextRefresh = retrySoon ? (MarketRefreshSchedule.retryDate(after: now) ?? MarketRefreshSchedule.nextRefresh(after: now)) : MarketRefreshSchedule.nextRefresh(after: now)
         let timer = Timer(timeInterval: max(1, nextRefresh.timeIntervalSinceNow), repeats: false) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                await self.model.refreshMarketData(force: true)
-                self.scheduleNextMarketRefresh()
+                let succeeded = await self.model.refreshMarketData(force: true)
+                self.scheduleNextMarketRefresh(retrySoon: !succeeded)
             }
         }
         marketRefreshTimer = timer
@@ -2024,9 +2311,10 @@ struct MenuPopoverView: View {
                     Text("账户与执行").font(.system(size: 10, weight: .semibold))
                     Spacer()
                     if snapshot.source.accountSource != nil {
-                        Label("IBKR 只读", systemImage: "checkmark.shield.fill")
+                        let accountFresh = !snapshot.freshnessIssues().contains(where: { $0.contains("IBKR") })
+                        Label(accountFresh ? "IBKR 只读" : "IBKR 待同步", systemImage: accountFresh ? "checkmark.shield.fill" : "clock.badge.exclamationmark")
                             .font(.system(size: 8, weight: .medium))
-                            .foregroundStyle(QDesign.positive)
+                            .foregroundStyle(accountFresh ? QDesign.positive : QDesign.caution)
                     }
                 }
                 HStack(alignment: .firstTextBaseline) {
@@ -2096,6 +2384,7 @@ struct MenuPopoverView: View {
 
     private func dataStatus(_ snapshot: QQQMSnapshot) -> (icon: String, title: String, detail: String, tint: Color) {
         let sourceDates = "行情 \(shortDate(snapshot.source.asOf)) · 账户 \(shortDate(snapshot.source.accountAsOf ?? snapshot.source.asOf))"
+        let freshnessIssues = snapshot.freshnessIssues()
         if model.isRefreshing {
             return ("arrow.triangle.2.circlepath", "正在更新市场数据", "上一份快照仍可安全使用", QDesign.accent)
         }
@@ -2104,6 +2393,10 @@ struct MenuPopoverView: View {
         }
         if !snapshot.auditIssues.isEmpty {
             return ("exclamationmark.triangle.fill", "数据校验发现差异", "\(snapshot.auditIssues.count) 项需检查 · \(sourceDates)", QDesign.caution)
+        }
+        if !freshnessIssues.isEmpty {
+            let onlyAccountPending = freshnessIssues.allSatisfy { $0.contains("IBKR") }
+            return ("clock.badge.exclamationmark", onlyAccountPending ? "市场已更新 · 账户待同步" : "部分数据待同步", freshnessIssues.joined(separator: "；"), QDesign.caution)
         }
         return ("checkmark.seal.fill", "数据已校验", sourceDates, QDesign.positive)
     }
@@ -2581,11 +2874,32 @@ struct QQQMBarSelfTest {
         let cnnJSON = #"{"fear_and_greed":{"score":54.4285714285714,"rating":"neutral","timestamp":"2026-08-28T23:59:58+00:00"}}"#.data(using: .utf8)!
         let cnn = try! LiveMarketDataService.parseCNNFearGreed(cnnJSON)
         precondition(abs(cnn.score - 54.4285714285714) < 0.0001 && cnn.localizedRating == "中性")
-        let beforeClose = ISO8601DateFormatter().date(from: "2026-08-31T20:14:00Z")!
-        let afterClose = ISO8601DateFormatter().date(from: "2026-08-31T20:16:00Z")!
-        precondition(MarketRefreshSchedule.nextRefresh(after: beforeClose).formatted(.iso8601) == "2026-08-31T20:15:00Z")
-        precondition(MarketRefreshSchedule.nextRefresh(after: afterClose).formatted(.iso8601) == "2026-09-01T20:15:00Z")
-        precondition(MarketRefreshSchedule.isDue(lastRefresh: beforeClose, now: afterClose))
+        let cnnMarketJSON = #"{"fear_and_greed":{"score":44.5714285714286,"rating":"fear","timestamp":"2026-09-01T23:30:10+00:00"},"market_volatility_vix":{"data":[{"x":1788293701000,"y":16.34,"rating":"extreme fear"}]}}"#.data(using: .utf8)!
+        let cnnMarket = try! LiveMarketDataService.parseCNNMarketObservation(cnnMarketJSON)
+        precondition(cnnMarket.fearGreed.localizedRating == "恐惧" && cnnMarket.vix.value == 16.34)
+        precondition(cnnMarket.vix.date.formatted(.iso8601) == "2026-09-01T20:15:01Z")
+        let beforeFirstRefresh = ISO8601DateFormatter().date(from: "2026-08-31T20:04:00Z")!
+        let afterFirstRefresh = ISO8601DateFormatter().date(from: "2026-08-31T20:06:00Z")!
+        precondition(MarketRefreshSchedule.nextRefresh(after: beforeFirstRefresh).formatted(.iso8601) == "2026-08-31T20:05:00Z")
+        precondition(MarketRefreshSchedule.nextRefresh(after: afterFirstRefresh).formatted(.iso8601) == "2026-09-01T20:05:00Z")
+        precondition(MarketRefreshSchedule.isDue(lastRefresh: beforeFirstRefresh, now: afterFirstRefresh))
+        let tuesdayEvening = ISO8601DateFormatter().date(from: "2026-09-01T23:30:00Z")!
+        let staleMonday = ISO8601DateFormatter().date(from: "2026-08-31T00:00:00Z")!
+        let freshTuesday = ISO8601DateFormatter().date(from: "2026-09-01T00:00:00Z")!
+        precondition(MarketRefreshSchedule.expectedSessionDate(at: tuesdayEvening) == freshTuesday)
+        precondition(!MarketRefreshSchedule.isFresh(marketDate: staleMonday, now: tuesdayEvening))
+        precondition(MarketRefreshSchedule.isFresh(marketDate: freshTuesday, now: tuesdayEvening))
+        precondition(MarketRefreshSchedule.retryDate(after: tuesdayEvening)?.formatted(.iso8601) == "2026-09-02T00:00:00Z")
+        let firstAttemptFailure = ISO8601DateFormatter().date(from: "2026-09-01T20:06:00Z")!
+        precondition(MarketRefreshSchedule.retryDate(after: firstAttemptFailure)?.formatted(.iso8601) == "2026-09-01T20:11:00Z")
+        let laborDay = ISO8601DateFormatter().date(from: "2026-09-07T21:00:00Z")!
+        precondition(MarketRefreshSchedule.expectedSessionDate(at: laborDay).formatted(.iso8601) == "2026-09-04T00:00:00Z")
+        precondition(MarketRefreshSchedule.nextRefresh(after: ISO8601DateFormatter().date(from: "2026-09-04T21:00:00Z")!).formatted(.iso8601) == "2026-09-08T20:05:00Z")
+        let infoJSON = #"{"data":{"secondaryData":{"lastSalePrice":"$291.40","lastTradeTimestamp":"Closed at Sep 1, 2026 4:00 PM ET"}}}"#.data(using: .utf8)!
+        let summaryJSON = #"{"data":{"summaryData":{"PreviousClose":{"value":"$295.18"},"TodayHighLow":{"value":"$293.30/$290.15"}}}}"#.data(using: .utf8)!
+        let officialClose = try! LiveMarketDataService.parseNasdaqOfficialClose(infoData: infoJSON, summaryData: summaryJSON)
+        precondition(officialClose.date == freshTuesday && officialClose.close == 291.40 && officialClose.previousClose == 295.18)
+        precondition(officialClose.low == 290.15 && officialClose.high == 293.30)
         precondition(snapshot.recommendation.nextExecution.formatted(.iso8601) == "2026-09-01T13:30:00Z")
         let now = Date()
         let calendar = Calendar.current
