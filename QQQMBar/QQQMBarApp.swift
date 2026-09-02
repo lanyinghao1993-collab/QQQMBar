@@ -1380,7 +1380,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSPopoverDeleg
 
 private enum DashboardLayout {
     static let width: CGFloat = 356
-    static let height: CGFloat = 600
+    static let height: CGFloat = 598
 }
 
 private enum TradeDirection: String { case buy, sell }
@@ -1432,8 +1432,9 @@ private enum QDesign {
     static let tertiary = Color(nsColor: .tertiaryLabelColor)
     static let accent = adaptive(light: 0x0B819D, dark: 0x31C3CE)
     static let positive = adaptive(light: 0x318A55, dark: 0x70C88A)
-    static let caution = adaptive(light: 0xA86C12, dark: 0xE5A52D)
-    static let negative = adaptive(light: 0xBB4B45, dark: 0xEC6F65)
+    static let caution = adaptive(light: 0x9A660D, dark: 0xE5A52D)
+    static let negative = adaptive(light: 0xB23D38, dark: 0xEC6F65)
+    static let axisLabel = adaptive(light: 0x5F6871, dark: 0x99A3AE)
     static let outerRadius: CGFloat = 15
     static let innerRadius: CGFloat = 8
     static let sectionPadding: CGFloat = 10
@@ -1467,16 +1468,25 @@ private struct QDecisionCanvas<Content: View>: View {
     init(@ViewBuilder content: () -> Content) { self.content = content() }
 
     var body: some View {
+        let outline = RoundedRectangle(cornerRadius: QDesign.outerRadius, style: .continuous)
+
         content
             .background {
-                RoundedRectangle(cornerRadius: QDesign.outerRadius, style: .continuous)
-                    .fill(QDesign.surface.opacity(colorScheme == .dark ? 0.93 : 0.98))
+                outline.fill(QDesign.surface.opacity(colorScheme == .dark ? 0.93 : 0.98))
             }
+            .clipShape(outline)
             .overlay {
-                RoundedRectangle(cornerRadius: QDesign.outerRadius, style: .continuous)
-                    .stroke(QDesign.separator.opacity(colorScheme == .dark ? 0.90 : 0.82), lineWidth: 0.5)
+                outline.strokeBorder(
+                    QDesign.separator.opacity(colorScheme == .dark ? 0.96 : 0.92),
+                    lineWidth: 0.9
+                )
             }
-            .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.22 : 0.10), radius: 12, y: 5)
+            .shadow(
+                color: Color.black.opacity(colorScheme == .dark ? 0.13 : 0.055),
+                radius: 6,
+                x: 0,
+                y: 0
+            )
     }
 }
 
@@ -1487,35 +1497,33 @@ private struct QuoteContextStrip: View {
     let valuation: String
 
     var body: some View {
-        HStack(spacing: 0) {
+        HStack(spacing: 12) {
             metric(
                 title: "30D",
                 value: String(format: "%+.1f%%", periodReturn),
                 tint: periodTint
             )
-            Divider().frame(height: 20)
             metric(
                 title: "相对成本",
                 value: costDeviation.map { String(format: "%+.2f%%", $0) } ?? "—",
                 tint: (costDeviation ?? 0) < 0 ? QDesign.negative : QDesign.positive
             )
-            Divider().frame(height: 20)
             metric(title: "QQQM P/E", value: valuation, tint: QDesign.secondary)
         }
         .accessibilityElement(children: .combine)
     }
 
     private func metric(title: String, value: String, tint: Color) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 5) {
+        VStack(alignment: .leading, spacing: 3) {
             Text(title)
                 .font(.system(size: 7.5, weight: .medium))
                 .foregroundStyle(QDesign.tertiary)
             Text(value)
-                .font(.system(size: 9, weight: .semibold, design: .rounded))
+                .font(.system(size: 10.5, weight: .semibold, design: .rounded))
                 .foregroundStyle(tint)
                 .monospacedDigit()
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -1525,11 +1533,11 @@ private struct CashFlowEquation: View {
     private var remainingFunds: Double { max(0, availableFunds - planAmount) }
 
     var body: some View {
-        HStack(spacing: 7) {
+        HStack(alignment: .bottom, spacing: 7) {
             term("可用资金", availableFunds, tint: QDesign.primary)
-            Text("−").foregroundStyle(QDesign.tertiary)
+            Text("−").font(.system(size: 11, weight: .medium)).foregroundStyle(QDesign.tertiary)
             term("本期计划", planAmount, tint: QDesign.accent)
-            Text("=").foregroundStyle(QDesign.tertiary)
+            Text("=").font(.system(size: 11, weight: .medium)).foregroundStyle(QDesign.tertiary)
             term("计划后可用", remainingFunds, tint: availableFunds >= planAmount ? QDesign.positive : QDesign.caution)
         }
         .accessibilityElement(children: .combine)
@@ -1739,7 +1747,7 @@ private struct DecisionPriceChart: View {
                         }
                     }
                     .font(.system(size: 7, weight: .medium, design: .rounded))
-                    .foregroundStyle(QDesign.tertiary)
+                    .foregroundStyle(QDesign.axisLabel)
                 }
             }
             .chartXSelection(value: $selectedDate)
@@ -1753,7 +1761,7 @@ private struct DecisionPriceChart: View {
                 Text(snapshot.priceHistory.last?.date ?? snapshot.lastUpdated, format: .dateTime.month(.defaultDigits).day())
             }
             .font(.system(size: 7.5, weight: .medium, design: .rounded))
-            .foregroundStyle(QDesign.secondary)
+            .foregroundStyle(QDesign.axisLabel)
             .padding(.trailing, 24)
 
             TradeExecutionBand(events: tradeEvents)
@@ -1919,15 +1927,22 @@ private struct CompactFactorMetric: View {
             }
             .frame(height: 10)
 
-            HStack {
-                Text("低")
-                Spacer()
-                Text(status).foregroundStyle(tint)
-                Spacer()
-                Text("高")
+            GeometryReader { proxy in
+                ZStack {
+                    HStack {
+                        Text("低")
+                        Spacer()
+                        Text("高")
+                    }
+                    Text(status)
+                        .font(.system(size: 6.8, weight: .semibold))
+                        .foregroundStyle(tint)
+                        .position(x: min(max(proxy.size.width * clamped, 22), max(proxy.size.width - 22, 22)), y: proxy.size.height / 2)
+                }
+                .font(.system(size: 6.8, weight: .medium))
+                .foregroundStyle(QDesign.tertiary)
             }
-            .font(.system(size: 6.8, weight: .medium))
-            .foregroundStyle(QDesign.tertiary)
+            .frame(height: 9)
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(title) \(value)，\(status)")
@@ -2127,8 +2142,8 @@ struct MenuPopoverView: View {
             if let snapshot = model.snapshot { content(snapshot) }
             else { unavailable }
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 7)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 5)
         .frame(width: DashboardLayout.width, height: DashboardLayout.height, alignment: .top)
         .background {
             ZStack {
@@ -2195,6 +2210,7 @@ struct MenuPopoverView: View {
                 VStack(alignment: .trailing, spacing: 2) {
                     Text(executionLabel(snapshot.recommendation.nextExecution))
                         .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(executionLabel(snapshot.recommendation.nextExecution) == "已到期" ? QDesign.caution : QDesign.primary)
                     Text(snapshot.recommendation.nextExecution, format: .dateTime.month(.defaultDigits).day().weekday(.abbreviated))
                         .font(.system(size: 8.5)).foregroundStyle(QDesign.secondary)
                 }
@@ -2215,8 +2231,8 @@ struct MenuPopoverView: View {
 #endif
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 9)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 7)
     }
 
     private func marketPanel(_ snapshot: QQQMSnapshot) -> some View {
@@ -2224,9 +2240,9 @@ struct MenuPopoverView: View {
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 1) {
                         Text("QQQM · 市场位置")
-                            .font(.system(size: 13, weight: .semibold))
+                            .font(.system(size: 11, weight: .semibold))
                         Text("近 30 个交易日")
-                            .font(.system(size: 9)).foregroundStyle(QDesign.secondary)
+                            .font(.system(size: 8)).foregroundStyle(QDesign.secondary)
                     }
                     Spacer()
                     Text(usd(snapshot.quote.lastPrice, decimals: 2))
@@ -2242,7 +2258,7 @@ struct MenuPopoverView: View {
                     valuation: signal(snapshot, 3).value
                 )
                 DecisionPriceChart(snapshot: snapshot)
-                HStack(spacing: 10) {
+                HStack(spacing: 12) {
                     chartLegend(color: QDesign.accent, label: "收盘价")
                     chartLegend(color: QDesign.secondary, label: "EMA20", dashed: true)
                     chartLegend(color: QDesign.caution, label: "成本 \(usd(snapshot.portfolio.averageCost, decimals: 2))", dashed: true)
@@ -2252,15 +2268,15 @@ struct MenuPopoverView: View {
                 }
                 .font(.system(size: 9, weight: .medium, design: .rounded))
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
     }
 
     private func evidencePanel(_ snapshot: QQQMSnapshot) -> some View {
         VStack(alignment: .leading, spacing: 7) {
                 HStack {
                     Text("本期依据")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.system(size: 11, weight: .semibold))
                     Spacer()
                     HStack(spacing: 5) {
                         Text("多投 OR \(moreTriggerCount(snapshot))/3")
@@ -2269,7 +2285,7 @@ struct MenuPopoverView: View {
                         Text("少投 AND \(lessTriggerCount(snapshot))/3")
                             .foregroundStyle(lessTriggerCount(snapshot) == 3 ? QDesign.caution : QDesign.secondary)
                     }
-                    .font(.system(size: 7.5, weight: .medium)).foregroundStyle(QDesign.secondary)
+                    .font(.system(size: 8, weight: .medium)).foregroundStyle(QDesign.secondary)
                 }
                 HStack(alignment: .top, spacing: 10) {
                     CompactFactorMetric(
@@ -2301,14 +2317,14 @@ struct MenuPopoverView: View {
                 )
                 }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
     }
 
     private func portfolioPanel(_ snapshot: QQQMSnapshot) -> some View {
         VStack(spacing: 6) {
                 HStack {
-                    Text("账户与执行").font(.system(size: 10, weight: .semibold))
+                    Text("账户与执行").font(.system(size: 11, weight: .semibold))
                     Spacer()
                     if snapshot.source.accountSource != nil {
                         let accountFresh = !snapshot.freshnessIssues().contains(where: { $0.contains("IBKR") })
@@ -2322,7 +2338,7 @@ struct MenuPopoverView: View {
                         Text(String(format: "%.4f 股 QQQM", snapshot.portfolio.shares))
                             .font(.system(size: 12, weight: .semibold, design: .rounded))
                         Text("市值 \(usd(snapshot.verifiedMarketValue))")
-                            .font(.system(size: 8)).foregroundStyle(QDesign.secondary)
+                            .font(.system(size: 9)).foregroundStyle(QDesign.secondary)
                     }
                     Spacer()
                     VStack(alignment: .trailing, spacing: 2) {
@@ -2341,8 +2357,8 @@ struct MenuPopoverView: View {
                 )
                 FundsCoverageRail(availableFunds: snapshot.portfolio.availableFunds, planAmount: snapshot.recommendation.recommendedAmount)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
     }
 
     private func footer(_ snapshot: QQQMSnapshot) -> some View {
@@ -2360,7 +2376,8 @@ struct MenuPopoverView: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(QDesign.positive)
                     .frame(width: 154, height: 32)
-                    .background(QDesign.positive.opacity(0.09), in: RoundedRectangle(cornerRadius: QDesign.innerRadius, style: .continuous))
+                    .background(QDesign.positive.opacity(0.10), in: RoundedRectangle(cornerRadius: QDesign.innerRadius, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: QDesign.innerRadius, style: .continuous).stroke(QDesign.positive.opacity(colorScheme == .dark ? 0.32 : 0.26), lineWidth: 0.5))
             } else {
                 Button { model.confirmPlan() } label: {
                     HStack(spacing: 7) {
@@ -2371,15 +2388,16 @@ struct MenuPopoverView: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(QDesign.accent)
                     .frame(width: 154, height: 32)
-                    .background(QDesign.accent.opacity(colorScheme == .dark ? 0.10 : 0.08), in: RoundedRectangle(cornerRadius: QDesign.innerRadius, style: .continuous))
+                    .background(QDesign.accent.opacity(colorScheme == .dark ? 0.13 : 0.10), in: RoundedRectangle(cornerRadius: QDesign.innerRadius, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: QDesign.innerRadius, style: .continuous).stroke(QDesign.accent.opacity(colorScheme == .dark ? 0.44 : 0.36), lineWidth: 0.5))
                 }
                 .buttonStyle(PrimaryActionButtonStyle())
                 .keyboardShortcut(.return, modifiers: [])
                 .help("仅保存本地确认记录，不会创建或提交交易订单。")
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
     }
 
     private func dataStatus(_ snapshot: QQQMSnapshot) -> (icon: String, title: String, detail: String, tint: Color) {
