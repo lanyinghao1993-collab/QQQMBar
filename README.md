@@ -26,6 +26,24 @@ macOS 26 原生菜单栏 QQQM 定投计划助手。它只读取、计算、显�
 
 定投基数固定为每期 `US$400`，并限制在 `US$200 / 300 / 400 / 500 / 600` 五档：显著下跌、低情绪或高 VIX 时多投；明显上涨、强情绪且低 VIX 时少投；其余维持基准。菜单栏圆点会在计划日前 3 天出现，绿色表示多投、青色表示基准、琥珀色表示少投、红色表示逾期或数据异常。该规则仅生成提醒，不会自动下单。
 
+## 给朋友或家人安装（本机之外的 Mac）
+
+> 当前安装包使用 **ad-hoc 签名**（没有 Apple Developer ID 认证），因此 macOS 的 Gatekeeper 会拦下"从网络下载"的 App。它只适合自己用、或你信任的熟人。要将它交给别人，先生成安装包，再把下面任一种方法教给对方。
+
+**生成安装包**：在项目目录运行 `build-and-install.command`，产出 `~/Applications/QQQMBar.app`。要分发给别人，把整个 `QQQMBar.app` 压缩成 zip 发过去即可。
+
+**对方 Mac 上，任选一种方式打开：**
+
+1. **右键 → 打开**：在 Finder 里右键点 App → 选"打开"，在弹出的确认框点"仍然打开"（仅此一次放行）。
+2. 若双击弹"无法验证开发者"：**按住 `control` 再点 App → 打开 → 仍然打开**。
+3. 彻底去除隔离标记（一次性，以后可正常双击）——在"终端"运行：
+   ```bash
+   xattr -d com.apple.quarantine /Applications/QQQMBar.app
+   ```
+4. （不推荐）系统设置 → 隐私与安全性 → 拉到"已阻止使用"→ 点"仍要打开"。
+
+> 这是 ad-hoc 签名的固有取舍：不做 Developer ID 签名 + notarization，就无法让 Gatekeeper 完全放行。以后若想给不认识的网友分发，再办开发者账号做签名与公证即可（见下文）。
+
 ## 数据与安全
 
 - 启用 App Sandbox 后，所有本地数据位于 `~/Library/Containers/com.lyh.qqqmbar/Data/Library/Application Support/QQQMBar/`。
